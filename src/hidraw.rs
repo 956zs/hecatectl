@@ -1,0 +1,227 @@
+//! hidraw transport: find the vendor config interface and run request/response transactions.
+
+use crate::protocol::{self, Packet, PACKET_LEN};
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+pub const VENDOR_ID: u16 = 0x35bb;
+/// 2.4 GHz receiver and wired (USB-C) product IDs of the G3M PRO updated version.
+pub const PRODUCT_IDS: [(u16, &str); 2] = [(0xd3fb, "2.4G receiver"), (0xd3fc, "wired")];
+/// Vendor usage page that carries the 0x08 config report.
+const CONFIG_USAGE_PAGE: u16 = 0xff02;
+
+/// Same retry policy as the vendor library: 2 tries, 200 ms each.
+const TRIES: u32 = 2;
+const TIMEOUT: Duration = Duration::from_millis(200);
+
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    pub node: PathBuf,
+    pub product_id: u16,
+    pub kind: &'static str,
+}
+
+/// Lists hidraw nodes that belong to a supported mouse and expose the config report.
+pub fn find_devices() -> Vec<DeviceInfo> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir("/sys/class/hidraw") else { return out };
+    for e in entries.flatten() {
+        let sys = e.path();
+        let Ok(uevent) = fs::read_to_string(sys.join("device/uevent")) else { continue };
+        let Some((vid, pid)) = parse_hid_id(&uevent) else { continue };
+        if vid != VENDOR_ID {
+            continue;
+        }
+        let Some(&(_, kind)) = PRODUCT_IDS.iter().find(|(p, _)| *p == pid) else { continue };
+        let Ok(desc) = fs::read(sys.join("device/report_descriptor")) else { continue };
+        if !report_ids_on_page(&desc, CONFIG_USAGE_PAGE).contains(&protocol::REPORT_ID) {
+            continue;
+        }
+        out.push(DeviceInfo { node: Path::new("/dev").join(e.file_name()), product_id: pid, kind });
+    }
+    out.sort_by(|a, b| a.node.cmp(&b.node));
+    out
+}
+
+/// Parses `HID_ID=0003:000035BB:0000D3FB` from a hidraw uevent.
+pub fn parse_hid_id(uevent: &str) -> Option<(u16, u16)> {
+    let id = uevent.lines().find_map(|l| l.strip_prefix("HID_ID="))?;
+    let mut parts = id.split(':');
+    let _bus = parts.next()?;
+    let vid = u32::from_str_radix(parts.next()?, 16).ok()?;
+    let pid = u32::from_str_radix(parts.next()?, 16).ok()?;
+    Some((u16::try_from(vid).ok()?, u16::try_from(pid).ok()?))
+}
+
+/// Walks HID short items and returns the report IDs declared while `page` is the usage page.
+pub fn report_ids_on_page(desc: &[u8], page: u16) -> Vec<u8> {
+    let mut ids = Vec::new();
+    let mut cur_page: u32 = 0;
+    let mut i = 0;
+    while i < desc.len() {
+        let prefix = desc[i];
+        if prefix == 0xfe {
+            // long item: 0xfe, size, tag, data
+            let size = *desc.get(i + 1).unwrap_or(&0) as usize;
+            i += 3 + size;
+            continue;
+        }
+        let size = match prefix & 0x03 {
+            3 => 4,
+            n => n as usize,
+        };
+        let Some(data) = desc.get(i + 1..i + 1 + size) else { break };
+        let value = data.iter().rev().fold(0u32, |acc, b| (acc << 8) | *b as u32);
+        match prefix & 0xfc {
+            0x04 => cur_page = value,                                    // Usage Page
+            0x84 if cur_page == page as u32 => ids.push(value as u8),    // Report ID
+            _ => {}
+        }
+        i += 1 + size;
+    }
+    ids
+}
+
+/// Set to print every request/response packet on stderr.
+const DEBUG_ENV: &str = "HECATECTL_DEBUG";
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+}
+
+pub struct Device {
+    file: File,
+    debug: bool,
+}
+
+impl Device {
+    pub fn open(node: &Path) -> Result<Self, String> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(node)
+            .map_err(|e| match e.kind() {
+                ErrorKind::PermissionDenied => format!(
+                    "{}: permission denied (install udev/70-hecatectl.rules, then replug the receiver)",
+                    node.display()
+                ),
+                _ => format!("{}: {e}", node.display()),
+            })?;
+        Ok(Self { file, debug: std::env::var_os(DEBUG_ENV).is_some() })
+    }
+
+    /// Sends `req` and waits for the matching response, like the vendor library does.
+    pub fn transact(&mut self, req: &Packet) -> Result<Packet, String> {
+        for _ in 0..TRIES {
+            self.drain();
+            if self.debug {
+                eprintln!("tx {}", hex(req));
+            }
+            self.file.write_all(req).map_err(|e| format!("write: {e}"))?;
+            if let Some(resp) = self.wait_for(req)? {
+                if self.debug {
+                    eprintln!("rx {}", hex(&resp));
+                }
+                return Ok(resp);
+            }
+        }
+        Err(format!("no response to command 0x{:02x} (is the mouse awake and paired?)", req[1]))
+    }
+
+    fn wait_for(&mut self, req: &Packet) -> Result<Option<Packet>, String> {
+        let deadline = Instant::now() + TIMEOUT;
+        let mut buf = [0u8; 64];
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || !self.poll_readable(left)? {
+                return Ok(None);
+            }
+            match self.file.read(&mut buf) {
+                Ok(n) if protocol::is_response_to(req, &buf[..n]) => {
+                    let mut p = [0u8; PACKET_LEN];
+                    p.copy_from_slice(&buf[..PACKET_LEN]);
+                    return Ok(Some(p));
+                }
+                Ok(n) => {
+                    // mouse motion, unsolicited 08 0a / 08 b8 notices, or other reports
+                    if self.debug && buf[0] == protocol::REPORT_ID {
+                        eprintln!("rx (skipped) {}", hex(&buf[..n]));
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(e) => return Err(format!("read: {e}")),
+            }
+        }
+    }
+
+    /// Discards queued input reports so stale answers cannot match.
+    fn drain(&mut self) {
+        let mut buf = [0u8; 64];
+        while self.file.read(&mut buf).is_ok() {}
+    }
+
+    fn poll_readable(&self, timeout: Duration) -> Result<bool, String> {
+        let mut pfd = libc::pollfd { fd: self.file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let ms = timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
+        // SAFETY: pfd is a valid pollfd for the duration of the call.
+        let r = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(format!("poll: {e}"));
+        }
+        Ok(r > 0 && pfd.revents & libc::POLLIN != 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Report descriptor of interface 1 of the 35BB:D3FB receiver (from sysfs).
+    const RECEIVER_IF1: &str = "05010902a10185010901a1000509190129051500250195057501810295017503810105010930093116018026ff7f75109502810609381581257f750895018106050c0a380295018106c0c00603ff0900a10185020900150026ff00750895078102c0050c0901a101850526140519002a1405751095018100c005010980a1018503198129832501950375018102950175058101c00602ff0902a101850826ff00750895100902810009029100c00604ff0902a101850609029507b102c0";
+    // Interface 0 (keyboard), which has no config report.
+    const RECEIVER_IF0: &str = "05010906a101050719e029e715002501750195088102750895018101050719002aff0026ff00750895068100c0";
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn finds_config_report_on_vendor_page() {
+        assert_eq!(report_ids_on_page(&hex(RECEIVER_IF1), 0xff02), vec![0x08]);
+        assert_eq!(report_ids_on_page(&hex(RECEIVER_IF1), 0xff04), vec![0x06]);
+    }
+
+    #[test]
+    fn keyboard_interface_has_no_config_report() {
+        assert!(report_ids_on_page(&hex(RECEIVER_IF0), 0xff02).is_empty());
+    }
+
+    #[test]
+    fn empty_and_truncated_descriptors() {
+        assert!(report_ids_on_page(&[], 0xff02).is_empty());
+        // usage page item whose data runs past the end
+        assert!(report_ids_on_page(&[0x06, 0x02], 0xff02).is_empty());
+    }
+
+    #[test]
+    fn parses_hid_id() {
+        let ue = "DRIVER=hid-generic\nHID_ID=0003:000035BB:0000D3FB\nHID_NAME=HECATE\n";
+        assert_eq!(parse_hid_id(ue), Some((0x35bb, 0xd3fb)));
+    }
+
+    #[test]
+    fn rejects_bad_hid_id() {
+        assert_eq!(parse_hid_id(""), None);
+        assert_eq!(parse_hid_id("HID_ID=0003:zz:0000D3FB"), None);
+        assert_eq!(parse_hid_id("HID_ID=0003:0001000000:0000D3FB"), None);
+    }
+}

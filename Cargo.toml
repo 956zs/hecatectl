@@ -1,0 +1,15 @@
+[package]
+name = "hecatectl"
+version = "0.1.0"
+edition = "2021"
+description = "Configure HECATE G3M PRO (updated) mice on Linux over hidraw"
+license = "MIT"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
