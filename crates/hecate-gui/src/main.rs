@@ -4,6 +4,10 @@ mod bridge;
 mod config;
 mod display;
 mod dpi_slider;
+mod hid;
+mod keymap;
+mod macro_lib;
+mod macro_name;
 mod palette;
 mod settings_map;
 mod strings;
@@ -30,6 +34,8 @@ struct Options {
     screenshot: Option<String>,
     /// `--page N`: start on navigation entry N.
     page: i32,
+    /// `--import-device-macros`: run "Import from device" once the slots are read.
+    import_device_macros: bool,
 }
 
 fn parse_options(args: &[String]) -> Result<Options, String> {
@@ -40,6 +46,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             "--screenshot" => {
                 opts.screenshot = Some(it.next().filter(|p| !p.is_empty()).ok_or("--screenshot needs a path")?.clone())
             }
+            "--import-device-macros" => opts.import_device_macros = true,
             "--page" => {
                 let n = it.next().ok_or("--page needs a number")?;
                 opts.page = n.parse().ok().filter(|n| *n >= 0).ok_or_else(|| format!("--page: '{n}' is not a page number"))?;
@@ -72,6 +79,7 @@ fn main() -> ExitCode {
 
     let mut initial = QMap::<QMapPair_QString_QVariant>::default();
     initial.insert(QString::from("startPage"), QVariant::from(&opts.page));
+    initial.insert(QString::from("importDeviceMacros"), QVariant::from(&opts.import_device_macros));
     if let Some(path) = &opts.screenshot {
         initial.insert(QString::from("screenshotPath"), QVariant::from(&QString::from(path)));
     }
@@ -107,7 +115,8 @@ mod tests {
     #[test]
     fn screenshot_and_page() {
         let o = parse(&["--page", "1", "--screenshot", "/tmp/s.png"]).unwrap();
-        assert_eq!(o, Options { screenshot: Some("/tmp/s.png".into()), page: 1 });
+        assert_eq!(o, Options { screenshot: Some("/tmp/s.png".into()), page: 1, import_device_macros: false });
+        assert!(parse(&["--import-device-macros"]).unwrap().import_device_macros);
     }
 
     #[test]

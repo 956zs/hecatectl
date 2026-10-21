@@ -7,5 +7,7 @@
   "default_language": "zh_TW",
   "font_family": "Google Sans Flex",
   "icon_font_family": "Material Symbols Rounded",
-  "product_url": "https://www.edifier.com/product/support-789.html"
+  "product_url": "https://www.edifier.com/product/support-789.html",
+  "macro_dir": "hecate-gui/macros",
+  "macro_name_encoding": "big5"
 }

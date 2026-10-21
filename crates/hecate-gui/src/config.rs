@@ -1,6 +1,7 @@
 //! App settings: the shipped `resources/config.json`, with `$XDG_CONFIG_HOME/hecate-gui/config.json`
 //! merged over it when present.
 
+use crate::macro_name::NameEncoding;
 use crate::strings;
 use serde_json::{Map, Value};
 use std::ffi::OsString;
@@ -32,6 +33,10 @@ pub struct Config {
     pub icon_font_family: String,
     /// "Product Specification" page (vendor FUN_140243010).
     pub product_url: String,
+    /// Macro library directory; relative paths are under `$XDG_CONFIG_HOME` (default `~/.config`).
+    pub macro_dir: PathBuf,
+    /// Encoding of macro names written to the mouse.
+    pub macro_name_encoding: NameEncoding,
 }
 
 pub fn get() -> &'static Config {
@@ -103,6 +108,9 @@ pub fn parse(user: Option<&str>) -> Result<Config, String> {
         font_family: string("font_family")?,
         icon_font_family: string("icon_font_family")?,
         product_url: string("product_url")?,
+        macro_dir: PathBuf::from(string("macro_dir")?),
+        macro_name_encoding: NameEncoding::parse(&string("macro_name_encoding")?)
+            .ok_or("'macro_name_encoding' must be \"big5\" or \"utf-8\"")?,
     })
 }
 
@@ -115,6 +123,13 @@ pub fn xdg_dir(var: Option<OsString>, home: Option<OsString>, fallback: &str) ->
 }
 
 impl Config {
+    pub fn macro_dir_path(&self) -> Option<PathBuf> {
+        if self.macro_dir.is_absolute() {
+            return Some(self.macro_dir.clone());
+        }
+        xdg_dir(std::env::var_os("XDG_CONFIG_HOME"), std::env::var_os("HOME"), ".config").map(|d| d.join(&self.macro_dir))
+    }
+
     pub fn theme_colors_path(&self) -> Option<PathBuf> {
         resolve_state_path(&self.theme_colors_file, std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
     }
@@ -145,6 +160,8 @@ mod tests {
         assert_eq!(c.language, None);
         assert_eq!(c.theme_colors_file, Path::new("quickshell/user/generated/colors.json"));
         assert!(c.product_url.starts_with("https://"));
+        assert_eq!(c.macro_dir, Path::new("hecate-gui/macros"));
+        assert_eq!(c.macro_name_encoding, NameEncoding::Big5);
     }
 
     #[test]
@@ -178,6 +195,8 @@ mod tests {
         assert!(parse(Some(r#"{"font_family": 3}"#)).unwrap_err().contains("'font_family'"));
         assert!(parse(Some(r#"{"default_language": "fr"}"#)).unwrap_err().contains("'default_language'"));
         assert!(parse(Some(r#"{"language": "fr"}"#)).unwrap_err().contains("'language'"));
+        assert!(parse(Some(r#"{"macro_name_encoding": "gbk"}"#)).unwrap_err().contains("'macro_name_encoding'"));
+        assert_eq!(parse(Some(r#"{"macro_name_encoding": "utf-8"}"#)).unwrap().macro_name_encoding, NameEncoding::Utf8);
         assert!(parse(Some(r#"{"language": ""}"#)).unwrap_err().contains("'language'"));
     }
 

@@ -1,11 +1,14 @@
 //! Device worker thread: owns the hidraw handle, polls for hot-plug and sleep, and runs the
 //! commands the UI sends. Nothing here touches Qt; results go out through a `publish` callback.
 
+use crate::keymap::{self, Step};
+use crate::macro_name::NameEncoding;
 use crate::settings_map;
 use hecate_core::hidraw::{self, DeviceInfo};
 use hecate_core::mouse::{Mouse, PAIRING_POLLS, PAIRING_POLL_INTERVAL};
-use hecate_core::protocol::PairingStatus;
+use hecate_core::protocol::{PairingStatus, FLASH_CHUNK};
 use hecate_core::settings::Settings;
+use hecate_core::slots::Slots;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
@@ -16,6 +19,8 @@ pub enum Command {
     Refresh,
     /// A settings patch from the pages (see `settings_map`).
     Change(String),
+    /// A button assignment from the KeySet page (see `keymap`).
+    Assign(String),
     SetLongRange(bool),
     FactoryReset,
     StartPairing,
@@ -37,6 +42,25 @@ pub struct Snapshot {
     pub long_range: Option<bool>,
     /// The settings block as flash holds it; None until the first full read on this connection.
     pub settings: Option<Settings>,
+    /// Shortcut and macro slots, read with the settings.
+    pub slots: Option<Slots>,
+}
+
+/// Bytes at 0x000 compared on every online poll: rate, DPI count and active stage, LOD. One read,
+/// and it catches the on-mouse DPI and report-rate buttons as well as other programs.
+const HEAD_LEN: usize = FLASH_CHUNK;
+
+impl Snapshot {
+    /// The same device state with nothing read from flash: the pages show "loading" until a full read
+    /// succeeds, so values that may no longer be in flash are never shown or edited.
+    pub fn loading(&self) -> Snapshot {
+        Snapshot { settings: None, slots: None, long_range: None, ..self.clone() }
+    }
+}
+
+/// Whether the first bytes of flash differ from the settings last read.
+pub fn head_changed(settings: &Settings, head: &[u8]) -> bool {
+    head.get(..HEAD_LEN) != settings.raw().get(..HEAD_LEN)
 }
 
 pub enum Event {
@@ -58,8 +82,8 @@ pub struct Intervals {
 }
 
 /// Runs until the command channel closes or `publish` returns false (the UI object is gone).
-pub fn run(commands: Receiver<Command>, intervals: Intervals, publish: impl FnMut(Event) -> bool) {
-    let mut w = Worker { publish, alive: true, conn: None, state: Snapshot::default(), stale: true, poll_error: None };
+pub fn run(commands: Receiver<Command>, intervals: Intervals, encoding: NameEncoding, publish: impl FnMut(Event) -> bool) {
+    let mut w = Worker { publish, alive: true, conn: None, state: Snapshot::default(), stale: true, poll_error: None, encoding };
     w.poll();
     while w.alive {
         // Like the vendor connector: "connected" means online with the full read done.
@@ -68,6 +92,7 @@ pub fn run(commands: Receiver<Command>, intervals: Intervals, publish: impl FnMu
         match commands.recv_timeout(interval) {
             Ok(Command::Refresh) => w.command(|w| w.sync(true)),
             Ok(Command::Change(patch)) => w.command(|w| w.change(&patch)),
+            Ok(Command::Assign(assignment)) => w.command(|w| w.assign(&assignment)),
             Ok(Command::SetLongRange(on)) => w.command(|w| w.set_long_range(on)),
             Ok(Command::FactoryReset) => w.command(Worker::factory_reset),
             Ok(Command::StartPairing) => w.command(Worker::pair),
@@ -92,6 +117,8 @@ struct Worker<P> {
     /// Last error from polling and how many polls in a row hit it. Only a repeat is reported, and
     /// only once: over 2.4G a single read often fails while the mouse dozes off or wakes up.
     poll_error: Option<(String, u32)>,
+    /// Encoding for macro names written to the mouse.
+    encoding: NameEncoding,
 }
 
 /// UI key for the connection kind (hidraw::PRODUCT_IDS names the cable product "wired").
@@ -201,11 +228,28 @@ impl<P: FnMut(Event) -> bool> Worker<P> {
         if full || !was_online {
             self.stale = true;
         }
+        if let (false, Some(settings)) = (self.stale, &next.settings) {
+            if head_changed(settings, &conn.mouse.read_flash(0, HEAD_LEN)?) {
+                self.stale = true;
+            }
+        }
         if self.stale {
-            next.firmware = Some(conn.mouse.version()?);
-            next.settings = Some(conn.mouse.read_settings()?);
-            next.long_range = Some(conn.mouse.long_range()?);
-            self.stale = false;
+            // One locked operation, so settings and slots come from the same moment. The mouse was
+            // just seen online, so nothing inside waits for it while holding the lock.
+            let read = conn.mouse.exclusive(|m| Ok((m.version()?, m.read_settings()?, m.read_slots()?, m.long_range()?)));
+            match read {
+                Ok((firmware, settings, slots, long_range)) => {
+                    next.firmware = Some(firmware);
+                    next.settings = Some(settings);
+                    next.slots = Some(slots);
+                    next.long_range = Some(long_range);
+                    self.stale = false;
+                }
+                Err(e) => {
+                    *next = next.loading();
+                    return Err(e);
+                }
+            }
         }
         let battery = conn.mouse.battery()?;
         next.battery_percent = Some(battery.percent);
@@ -228,10 +272,18 @@ impl<P: FnMut(Event) -> bool> Worker<P> {
     fn change(&mut self, patch: &str) -> Result<(), String> {
         let result = self.try_change(patch);
         if result.is_err() {
-            // The original error is the one to report; a failing re-read shows up on the next poll.
-            let _ = self.sync(true);
+            self.reload();
         }
         result
+    }
+
+    /// After a failed write, reset or read: back to "loading" until a full read succeeds. A failing
+    /// re-read leaves the pages in that state; the original error is the one reported.
+    fn reload(&mut self) {
+        let loading = self.state.loading();
+        self.publish_state(loading);
+        self.stale = true;
+        let _ = self.sync(true);
     }
 
     fn try_change(&mut self, patch: &str) -> Result<(), String> {
@@ -242,6 +294,52 @@ impl<P: FnMut(Event) -> bool> Worker<P> {
         let fresh = self.conn.as_mut().ok_or(NO_DEVICE)?.mouse.apply(&old, &new)?;
         let mut next = self.state.clone();
         next.settings = Some(fresh);
+        self.publish_state(next);
+        Ok(())
+    }
+
+    /// Assigns a button: the planned slot write first (verified by `write_shortcut` / `write_macro`),
+    /// then the binding through `Mouse::apply`. After any failure everything is read again.
+    fn assign(&mut self, assignment: &str) -> Result<(), String> {
+        let result = self.try_assign(assignment);
+        if result.is_err() {
+            self.reload();
+        }
+        result
+    }
+
+    fn try_assign(&mut self, assignment: &str) -> Result<(), String> {
+        let assignment = keymap::parse_assignment(assignment)?;
+        self.awake_mouse()?;
+        let settings = self.state.settings.clone().ok_or("the settings have not been read yet")?;
+        let mut slots = self.state.slots.clone().ok_or("the key slots have not been read yet")?;
+        let steps = keymap::plan(&settings, &assignment, self.encoding)?;
+        let mouse = &mut self.conn.as_mut().ok_or(NO_DEVICE)?.mouse;
+        // Slot and binding in one locked operation; the steps are already in slot-first order. The
+        // binding step may be skipped as unchanged, so first check the settings are still what was read.
+        let settings = mouse.exclusive(|mouse| {
+            let mut settings = settings;
+            if mouse.read_settings()? != settings {
+                return Err("the mouse's settings changed since they were read; nothing was written".into());
+            }
+            for step in steps {
+                match step {
+                    Step::WriteShortcut(i, shortcut) => {
+                        mouse.write_shortcut(i, &shortcut)?;
+                        slots.shortcuts[i] = Some(shortcut);
+                    }
+                    Step::WriteMacro(i, m) => {
+                        mouse.write_macro(i, &m)?;
+                        slots.macros[i] = Some(m);
+                    }
+                    Step::Bind(new) => settings = mouse.apply(&settings, &new)?,
+                }
+            }
+            Ok(settings)
+        })?;
+        let mut next = self.state.clone();
+        next.settings = Some(settings);
+        next.slots = Some(slots);
         self.publish_state(next);
         Ok(())
     }
@@ -260,7 +358,7 @@ impl<P: FnMut(Event) -> bool> Worker<P> {
                 Ok(())
             }
             Err(e) => {
-                let _ = self.sync(true);
+                self.reload();
                 Err(e)
             }
         }
@@ -269,6 +367,10 @@ impl<P: FnMut(Event) -> bool> Worker<P> {
     /// `08 09`, then a full re-read like the vendor (FUN_140242e80).
     fn factory_reset(&mut self) -> Result<(), String> {
         let result = self.awake_mouse().and_then(|m| m.factory_reset());
+        // Everything read before is stale after a reset, acknowledged or not.
+        let loading = self.state.loading();
+        self.publish_state(loading);
+        self.stale = true;
         let reread = self.sync(true);
         result?;
         reread?;
@@ -282,26 +384,92 @@ impl<P: FnMut(Event) -> bool> Worker<P> {
         self.emit(Event::PairingProgress(0));
         let result = self.run_pairing();
         self.emit(Event::PairingFinished(result == Ok(true)));
-        let _ = self.sync(true);
+        self.reload();
         result.map(|_| ())
     }
 
     /// True when paired. An unanswered status poll counts as failed, as in the vendor app.
     fn run_pairing(&mut self) -> Result<bool, String> {
         self.sync(false)?;
-        // The vendor ignores the StartPair reply and polls either way (FUN_1400fc730).
-        if let Err(e) = self.conn.as_mut().ok_or(NO_DEVICE)?.mouse.start_pairing() {
-            eprintln!("hecate-gui: start pairing: {e}");
-        }
-        for poll in 1..=PAIRING_POLLS {
-            let status = self.conn.as_mut().ok_or(NO_DEVICE)?.mouse.pairing_status();
-            match status {
-                Ok(PairingStatus::InProgress(_)) => self.emit(Event::PairingProgress(poll)),
-                Ok(PairingStatus::Paired) => return Ok(true),
-                Ok(PairingStatus::Failed) | Err(_) => return Ok(false),
+        let Worker { conn, publish, alive, .. } = self;
+        let mouse = &mut conn.as_mut().ok_or(NO_DEVICE)?.mouse;
+        // StartPair and the polls in one locked operation, as core asks.
+        mouse.exclusive(|mouse| {
+            // The vendor ignores the StartPair reply and polls either way (FUN_1400fc730).
+            if let Err(e) = mouse.start_pairing() {
+                eprintln!("hecate-gui: start pairing: {e}");
             }
-            std::thread::sleep(PAIRING_POLL_INTERVAL);
+            for poll in 1..=PAIRING_POLLS {
+                match mouse.pairing_status() {
+                    Ok(PairingStatus::InProgress(_)) => {
+                        if !publish(Event::PairingProgress(poll)) {
+                            *alive = false;
+                        }
+                    }
+                    Ok(PairingStatus::Paired) => return Ok(true),
+                    Ok(PairingStatus::Failed) | Err(_) => return Ok(false),
+                }
+                std::thread::sleep(PAIRING_POLL_INTERVAL);
+            }
+            Ok(false)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hecate_core::protocol::{checksum, CONFIG_BLOCK_LEN};
+    use hecate_core::settings::{self, Block};
+
+    fn read_settings() -> Settings {
+        let mut b: Block = [0xFF; CONFIG_BLOCK_LEN];
+        for (at, v) in [(0x00, 1u8), (0x02, 6), (0x04, 2), (0x0A, 1)] {
+            b[at] = v;
+            b[at + 1] = checksum(&[v]);
         }
-        Ok(false)
+        settings::decode(&b)
+    }
+
+    /// Review R1: a change at 0x000..0x00A made outside this app (DPI or rate button on the mouse, the
+    /// CLI) is noticed on the next online poll.
+    #[test]
+    fn r1_head_change_marks_the_snapshot_stale() {
+        let s = read_settings();
+        let head = s.raw()[..HEAD_LEN].to_vec();
+        assert!(!head_changed(&s, &head));
+        // DPI button: active stage 2 -> 3.
+        let mut moved = head.clone();
+        moved[4] = 3;
+        moved[5] = checksum(&[3]);
+        assert!(head_changed(&s, &moved));
+        // Rate button: 1000 -> 125 Hz.
+        let mut rate = head.clone();
+        rate[0] = 0x08;
+        assert!(head_changed(&s, &rate));
+        // A short read never counts as unchanged.
+        assert!(head_changed(&s, &head[..4]));
+        assert_eq!(HEAD_LEN, 10);
+    }
+
+    /// Review R4: after a failed write, reset or read, nothing read from flash stays published.
+    #[test]
+    fn r4_loading_drops_everything_read_from_flash() {
+        let s = Snapshot {
+            present: true,
+            online: true,
+            connection: "receiver",
+            battery_percent: Some(90),
+            charging: false,
+            firmware: Some(0x0313),
+            receiver_firmware: Some(0x0102),
+            long_range: Some(false),
+            settings: Some(read_settings()),
+            slots: Some(Slots::default()),
+        };
+        let l = s.loading();
+        assert_eq!((l.settings.is_none(), l.slots.is_none(), l.long_range.is_none()), (true, true, true));
+        assert_eq!((l.present, l.online, l.connection, l.battery_percent), (true, true, "receiver", Some(90)));
+        assert_eq!(l.firmware, Some(0x0313));
     }
 }

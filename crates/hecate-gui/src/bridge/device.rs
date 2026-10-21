@@ -24,6 +24,8 @@ pub mod qobject {
         #[qproperty(bool, loaded, READ, NOTIFY)]
         #[qproperty(QString, settings_json, READ, NOTIFY)]
         #[qproperty(QString, options_json, READ, CONSTANT)]
+        #[qproperty(QString, keys_json, READ, NOTIFY)]
+        #[qproperty(QString, device_macros_json, READ, NOTIFY)]
         #[qproperty(bool, busy, READ, NOTIFY)]
         #[qproperty(bool, pairing, READ, NOTIFY)]
         #[qproperty(f64, pairing_progress, READ, NOTIFY)]
@@ -37,6 +39,15 @@ pub mod qobject {
         /// Applies a settings patch (JSON object, see settings_map.rs), then reads the settings back.
         #[qinvokable]
         fn change(&self, patch: &QString);
+
+        /// Assigns a function to a button (JSON, see keymap.rs): slot first, then the binding.
+        #[qinvokable]
+        fn assign(&self, assignment: &QString);
+
+        /// A key pressed in the window (`KeyEvent.nativeScanCode`) as an event `{kind, code, name}`,
+        /// or an empty string for keys with no HID code.
+        #[qinvokable]
+        fn key_from_scan_code(&self, scan_code: i32) -> QString;
 
         /// Long-distance radio mode (`08 16`), read back afterwards.
         #[qinvokable]
@@ -73,6 +84,8 @@ use super::update;
 use crate::config;
 use crate::display;
 use crate::dpi_slider;
+use crate::hid;
+use crate::keymap;
 use crate::settings_map;
 use crate::worker::{self, Command, Event};
 use core::pin::Pin;
@@ -99,6 +112,10 @@ pub struct DeviceRust {
     /// `settings_map::to_json`, empty until loaded.
     settings_json: QString,
     options_json: QString,
+    /// `keymap::keys_view`, empty until loaded.
+    keys_json: QString,
+    /// `keymap::device_macros`, empty until loaded.
+    device_macros_json: QString,
     busy: bool,
     pairing: bool,
     /// 0..1 of the vendor's pairing poll budget.
@@ -109,7 +126,10 @@ pub struct DeviceRust {
 
 impl Default for DeviceRust {
     fn default() -> Self {
-        let options = settings_map::options(&config::get().product_url);
+        let mut options = settings_map::options(&config::get().product_url);
+        if let (Some(all), serde_json::Value::Object(keys)) = (options.as_object_mut(), keymap::options()) {
+            all.extend(keys);
+        }
         Self {
             present: false,
             online: false,
@@ -122,6 +142,8 @@ impl Default for DeviceRust {
             loaded: false,
             settings_json: QString::default(),
             options_json: QString::from(&options.to_string()),
+            keys_json: QString::default(),
+            device_macros_json: QString::default(),
             busy: false,
             pairing: false,
             pairing_progress: 0.0,
@@ -138,6 +160,23 @@ impl qobject::Device {
 
     pub fn change(&self, patch: &QString) {
         self.send(Command::Change(patch.to_string()));
+    }
+
+    pub fn assign(&self, assignment: &QString) {
+        self.send(Command::Assign(assignment.to_string()));
+    }
+
+    pub fn key_from_scan_code(&self, scan_code: i32) -> QString {
+        // X11 and Wayland keycodes are the evdev code plus 8.
+        let event = scan_code.checked_sub(8).and_then(|c| u16::try_from(c).ok()).and_then(hid::from_evdev);
+        let json = event.map(|(kind, code)| {
+            let mut v = hid::event_name(kind, code);
+            let obj = v.as_object_mut().expect("object");
+            obj.insert("kind".into(), kind.into());
+            obj.insert("code".into(), code.into());
+            v.to_string()
+        });
+        QString::from(&json.unwrap_or_default())
     }
 
     pub fn set_long_range(&self, on: bool) {
@@ -182,7 +221,16 @@ fn apply(mut device: Pin<&mut qobject::Device>, event: Event) {
             update!(device, long_range, long_range_changed, s.long_range.map_or(-1, i32::from));
             let json = s.settings.as_ref().map(|s| settings_map::to_json(s).to_string()).unwrap_or_default();
             update!(device, settings_json, settings_json_changed, QString::from(&json));
-            update!(device, loaded, loaded_changed, s.settings.is_some());
+            let (keys, macros) = match (&s.settings, &s.slots) {
+                (Some(settings), Some(slots)) => {
+                    let enc = config::get().macro_name_encoding;
+                    (keymap::keys_view(settings, slots, enc).to_string(), keymap::device_macros(slots, enc).to_string())
+                }
+                _ => Default::default(),
+            };
+            update!(device, keys_json, keys_json_changed, QString::from(&keys));
+            update!(device, device_macros_json, device_macros_json_changed, QString::from(&macros));
+            update!(device, loaded, loaded_changed, s.settings.is_some() && s.slots.is_some());
         }
         Event::Busy(busy) => update!(device, busy, busy_changed, busy),
         Event::ResetDone => device.as_mut().reset_finished(),
@@ -210,7 +258,7 @@ impl cxx_qt::Initialize for qobject::Device {
         let cfg = config::get();
         let intervals = worker::Intervals { offline: cfg.device_poll_offline, online: cfg.device_poll_online };
         let spawned = std::thread::Builder::new().name("hecate-device".into()).spawn(move || {
-            worker::run(rx, intervals, |event| qt.queue(move |device| apply(device, event)).is_ok());
+            worker::run(rx, intervals, cfg.macro_name_encoding, |event| qt.queue(move |device| apply(device, event)).is_ok());
         });
         match spawned {
             Ok(_) => self.as_mut().rust_mut().commands = Some(tx),

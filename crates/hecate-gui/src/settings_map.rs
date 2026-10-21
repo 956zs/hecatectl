@@ -29,12 +29,20 @@ pub enum Change {
     SensorSleepTime(u8),
     MouseSleepTime(u8),
     StageCount(u8),
-    CurrentStage(u8),
+    CurrentStage { stage: u8, expect: StageExpect },
     /// A typed DPI value; snapped and clamped like the vendor's edit box.
-    StageDpi { stage: u8, dpi: u32 },
+    StageDpi { stage: u8, dpi: u32, expect: StageExpect },
     /// A slider position, applied on release.
-    StagePosition { stage: u8, position: u32 },
-    StageColor { stage: u8, color: Rgb },
+    StagePosition { stage: u8, position: u32, expect: StageExpect },
+    StageColor { stage: u8, color: Rgb, expect: StageExpect },
+}
+
+/// What the page showed for a stage when the user acted on it. A stage change is refused when the
+/// stage no longer holds this, e.g. after a queued DPI Quantity change shifted the stages.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StageExpect {
+    pub reg: DpiValue,
+    pub color: Rgb,
 }
 
 fn hex_color(c: Rgb) -> String {
@@ -57,11 +65,14 @@ fn shown_stage_count(s: &Settings) -> u8 {
 pub fn to_json(s: &Settings) -> Value {
     let stages: Vec<Value> = (0..usize::from(MAX_SELECTABLE_STAGES))
         .map(|i| {
-            let dpi = s.dpi_stages[i].value.dpi();
+            let reg = s.dpi_stages[i].value;
+            let dpi = reg.dpi();
             json!({
                 "dpi": dpi,
                 "position": dpi_slider::position(dpi),
                 "color": hex_color(s.dpi_colors[i].value),
+                // Sent back as the expectation of stage patches.
+                "reg": [reg.x, reg.y, reg.ex],
             })
         })
         .collect();
@@ -111,15 +122,36 @@ fn boolean(value: &Value, key: &str) -> Result<bool, String> {
     value.as_bool().ok_or_else(|| format!("'{key}' must be true or false"))
 }
 
-/// `{"stage": n, <field>: ...}` objects of the per-stage changes.
-fn stage_object<'a>(value: &'a Value, key: &str, field: &str) -> Result<(u8, &'a Value), String> {
+/// `{"reg": [x, y, ex], "color": "#rrggbb"}`: the stage as the page showed it.
+fn parse_expect(v: &Value, key: &str) -> Result<StageExpect, String> {
+    let bad = || format!("'{key}.expect' must be {{\"reg\": [x, y, ex], \"color\": \"#rrggbb\"}}");
+    let obj = v.as_object().ok_or_else(bad)?;
+    let reg: Vec<u8> = obj
+        .get("reg")
+        .and_then(Value::as_array)
+        .ok_or_else(bad)?
+        .iter()
+        .map(|b| b.as_u64().and_then(|b| u8::try_from(b).ok()))
+        .collect::<Option<_>>()
+        .ok_or_else(bad)?;
+    let [x, y, ex] = reg[..] else { return Err(bad()) };
+    let color = obj.get("color").and_then(Value::as_str).and_then(parse_color).ok_or_else(bad)?;
+    Ok(StageExpect { reg: DpiValue { x, y, ex }, color })
+}
+
+/// `{"stage": n, <field>: ..., "expect": {...}}` objects of the per-stage changes.
+fn stage_patch<'a>(value: &'a Value, key: &str, field: Option<&str>) -> Result<(u8, Option<&'a Value>, StageExpect), String> {
     let obj = value.as_object().ok_or_else(|| format!("'{key}' must be an object"))?;
     let stage = small(obj.get("stage").ok_or_else(|| format!("'{key}' needs 'stage'"))?, &format!("{key}.stage"))?;
-    let v = obj.get(field).ok_or_else(|| format!("'{key}' needs '{field}'"))?;
-    if let Some(extra) = obj.keys().find(|k| *k != "stage" && *k != field) {
+    let v = match field {
+        Some(f) => Some(obj.get(f).ok_or_else(|| format!("'{key}' needs '{f}'"))?),
+        None => None,
+    };
+    let expect = parse_expect(obj.get("expect").ok_or_else(|| format!("'{key}' needs 'expect'"))?, key)?;
+    if let Some(extra) = obj.keys().find(|k| !["stage", "expect"].contains(&k.as_str()) && Some(k.as_str()) != field) {
         return Err(format!("'{key}' has an unknown key '{extra}'"));
     }
-    Ok((stage, v))
+    Ok((stage, v, expect))
 }
 
 /// Parses a patch object. Unknown keys and wrong types are errors naming the key. The changes
@@ -147,19 +179,22 @@ pub fn parse_patch(text: &str) -> Result<Vec<Change>, String> {
                 "sensorSleepTime" => Change::SensorSleepTime(small(v, k)?),
                 "mouseSleepTime" => Change::MouseSleepTime(small(v, k)?),
                 "dpiStageCount" => Change::StageCount(small(v, k)?),
-                "currentDpiStage" => Change::CurrentStage(small(v, k)?),
+                "currentDpiStage" => {
+                    let (stage, _, expect) = stage_patch(v, k, None)?;
+                    Change::CurrentStage { stage, expect }
+                }
                 "stageDpi" => {
-                    let (stage, dpi) = stage_object(v, k, "dpi")?;
-                    Change::StageDpi { stage, dpi: uint(dpi, "stageDpi.dpi")? }
+                    let (stage, dpi, expect) = stage_patch(v, k, Some("dpi"))?;
+                    Change::StageDpi { stage, dpi: uint(dpi.unwrap_or(&Value::Null), "stageDpi.dpi")?, expect }
                 }
                 "stagePosition" => {
-                    let (stage, p) = stage_object(v, k, "position")?;
-                    Change::StagePosition { stage, position: uint(p, "stagePosition.position")? }
+                    let (stage, p, expect) = stage_patch(v, k, Some("position"))?;
+                    Change::StagePosition { stage, position: uint(p.unwrap_or(&Value::Null), "stagePosition.position")?, expect }
                 }
                 "stageColor" => {
-                    let (stage, c) = stage_object(v, k, "color")?;
-                    let color = c.as_str().and_then(parse_color).ok_or("'stageColor.color' must be \"#rrggbb\"")?;
-                    Change::StageColor { stage, color }
+                    let (stage, c, expect) = stage_patch(v, k, Some("color"))?;
+                    let color = c.and_then(Value::as_str).and_then(parse_color).ok_or("'stageColor.color' must be \"#rrggbb\"")?;
+                    Change::StageColor { stage, color, expect }
                 }
                 _ => return Err(format!("unknown setting '{key}'")),
             })
@@ -175,13 +210,16 @@ fn choice(name: &str, value: u8, allowed: &[u8]) -> Result<u8, String> {
     }
 }
 
-/// A visible stage (below the stage count).
-fn visible_stage(s: &Settings, stage: u8) -> Result<usize, String> {
-    if stage < shown_stage_count(s) {
-        Ok(usize::from(stage))
-    } else {
-        Err(format!("DPI stage {} is not shown (stage count {})", stage + 1, shown_stage_count(s)))
+/// A visible stage (below the stage count) that still holds what the page showed.
+fn visible_stage(s: &Settings, stage: u8, expect: &StageExpect) -> Result<usize, String> {
+    if stage >= shown_stage_count(s) {
+        return Err(format!("DPI stage {} is not shown (stage count {})", stage + 1, shown_stage_count(s)));
     }
+    let i = usize::from(stage);
+    if s.dpi_stages[i].value != expect.reg || s.dpi_colors[i].value != expect.color {
+        return Err(format!("DPI stage {} changed since it was shown; nothing was written", stage + 1));
+    }
+    Ok(i)
 }
 
 /// The vendor's "DPI Quantity" handler (FUN_140236ef0): when the active stage falls outside the
@@ -225,23 +263,23 @@ pub fn apply(old: &Settings, changes: &[Change]) -> Result<Settings, String> {
             Change::SensorSleepTime(t) => s.sensor_sleep_time.set(choice("sensor sleep time", t, &SENSOR_SLEEP_TIMES)?),
             Change::MouseSleepTime(t) => s.all_led_off_time.set(choice("mouse sleep time", t, &MOUSE_SLEEP_TIMES)?),
             Change::StageCount(n) => set_stage_count(&mut s, n)?,
-            Change::CurrentStage(i) => {
-                let i = visible_stage(&s, i)?;
+            Change::CurrentStage { stage, expect } => {
+                let i = visible_stage(&s, stage, &expect)?;
                 s.current_dpi_stage.set(i as u8);
             }
-            Change::StageDpi { stage, dpi } => {
-                let i = visible_stage(&s, stage)?;
+            Change::StageDpi { stage, dpi, expect } => {
+                let i = visible_stage(&s, stage, &expect)?;
                 s.dpi_stages[i].set(DpiValue::from_dpi(dpi_slider::snap(dpi))?);
             }
-            Change::StagePosition { stage, position } => {
-                let i = visible_stage(&s, stage)?;
+            Change::StagePosition { stage, position, expect } => {
+                let i = visible_stage(&s, stage, &expect)?;
                 if position > dpi_slider::MAX_POSITION {
                     return Err(format!("slider position {position} is above {}", dpi_slider::MAX_POSITION));
                 }
                 s.dpi_stages[i].set(DpiValue::from_dpi(dpi_slider::to_dpi(position))?);
             }
-            Change::StageColor { stage, color } => {
-                let i = visible_stage(&s, stage)?;
+            Change::StageColor { stage, color, expect } => {
+                let i = visible_stage(&s, stage, &expect)?;
                 s.dpi_colors[i].set(color);
             }
         }
@@ -291,6 +329,17 @@ mod tests {
         }
     }
 
+    /// The expectation the page sends with a patch for stage `i` of `s`.
+    fn exp(s: &Settings, i: usize) -> StageExpect {
+        StageExpect { reg: s.dpi_stages[i].value, color: s.dpi_colors[i].value }
+    }
+
+    /// The same as patch JSON.
+    fn expect_json(s: &Settings, i: usize) -> String {
+        let r = s.dpi_stages[i].value;
+        format!(r#""expect": {{"reg": [{}, {}, {}], "color": "{}"}}"#, r.x, r.y, r.ex, hex_color(s.dpi_colors[i].value))
+    }
+
     /// Every patch result must pass the core's validation against the original.
     fn valid(new: &Settings) {
         settings::validate(&defaults(), new).unwrap();
@@ -310,7 +359,7 @@ mod tests {
         assert_eq!(v["currentDpiStage"], 2);
         let stages = v["stages"].as_array().unwrap();
         assert_eq!(stages.len(), 6);
-        assert_eq!(stages[0], json!({ "dpi": 400, "position": 14, "color": "#ff0000" }));
+        assert_eq!(stages[0], json!({ "dpi": 400, "position": 14, "color": "#ff0000", "reg": [7, 7, 0] }));
         assert_eq!(stages[5]["dpi"], 12000);
         assert_eq!(stages[5]["position"], 299);
     }
@@ -364,30 +413,33 @@ mod tests {
 
     #[test]
     fn stage_dpi_is_snapped_like_the_vendor() {
-        let s = patch(r#"{"stageDpi": {"stage": 0, "dpi": 6050}}"#);
+        let d = defaults();
+        let s = patch(&format!(r#"{{"stageDpi": {{"stage": 0, "dpi": 6050, {}}}}}"#, expect_json(&d, 0)));
         assert_eq!(s.dpi_stages[0].value.dpi(), 6000);
-        let s = patch(r#"{"stageDpi": {"stage": 1, "dpi": 40000}}"#);
+        let s = patch(&format!(r#"{{"stageDpi": {{"stage": 1, "dpi": 40000, {}}}}}"#, expect_json(&d, 1)));
         assert_eq!(s.dpi_stages[1].value.dpi(), 32000);
-        let s = patch(r#"{"stageDpi": {"stage": 1, "dpi": 1}}"#);
+        let s = patch(&format!(r#"{{"stageDpi": {{"stage": 1, "dpi": 1, {}}}}}"#, expect_json(&d, 1)));
         assert_eq!(s.dpi_stages[1].value.dpi(), 50);
         valid(&s);
     }
 
     #[test]
     fn slider_positions_set_the_stage() {
+        let e = expect_json(&defaults(), 2);
         for p in [0, 1, 239, 240, 439, 440, 499] {
-            let s = patch(&format!(r#"{{"stagePosition": {{"stage": 2, "position": {p}}}}}"#));
+            let s = patch(&format!(r#"{{"stagePosition": {{"stage": 2, "position": {p}, {e}}}}}"#));
             assert_eq!(s.dpi_stages[2].value.dpi(), dpi_slider::to_dpi(p));
             valid(&s);
         }
-        assert!(patch_err(r#"{"stagePosition": {"stage": 2, "position": 500}}"#).contains("500"));
+        assert!(patch_err(&format!(r#"{{"stagePosition": {{"stage": 2, "position": 500, {e}}}}}"#)).contains("500"));
     }
 
     #[test]
     fn colours_and_current_stage() {
-        let s = patch(r##"{"stageColor": {"stage": 3, "color": "#12ab9F"}}"##);
+        let d = defaults();
+        let s = patch(&format!(r##"{{"stageColor": {{"stage": 3, "color": "#12ab9F", {}}}}}"##, expect_json(&d, 3)));
         assert_eq!(s.dpi_colors[3].value, Rgb { r: 0x12, g: 0xab, b: 0x9f });
-        let s = patch(r#"{"currentDpiStage": 5}"#);
+        let s = patch(&format!(r#"{{"currentDpiStage": {{"stage": 5, {}}}}}"#, expect_json(&d, 5)));
         assert_eq!(s.current_dpi_stage.value, 5);
         valid(&s);
     }
@@ -396,11 +448,49 @@ mod tests {
     fn hidden_stages_are_refused() {
         let d = apply(&defaults(), &[Change::StageCount(3)]).unwrap();
         for change in [
-            Change::CurrentStage(3),
-            Change::StageDpi { stage: 3, dpi: 800 },
-            Change::StageColor { stage: 5, color: Rgb { r: 0, g: 0, b: 0 } },
+            Change::CurrentStage { stage: 3, expect: exp(&d, 3) },
+            Change::StageDpi { stage: 3, dpi: 800, expect: exp(&d, 3) },
+            Change::StageColor { stage: 5, color: Rgb { r: 0, g: 0, b: 0 }, expect: exp(&d, 5) },
         ] {
-            assert!(apply(&d, std::slice::from_ref(&change)).is_err(), "{change:?}");
+            let e = apply(&d, std::slice::from_ref(&change)).unwrap_err();
+            assert!(e.contains("not shown"), "{change:?}: {e}");
+        }
+    }
+
+    /// Review R3: stages 400/800/1600*/...; DPI Quantity 2 is written (1600 moves to index 1), then the
+    /// queued patch typed into the card that showed 800 (index 1) arrives. It must not land on 1600.
+    #[test]
+    fn r3_queued_stage_patch_is_refused_after_a_shift() {
+        let shown = defaults();
+        let after_count = apply(&shown, &[Change::StageCount(2)]).unwrap();
+        assert_eq!(after_count.dpi_stages[1].value.dpi(), 1600);
+        for queued in [
+            Change::StageDpi { stage: 1, dpi: 900, expect: exp(&shown, 1) },
+            Change::StagePosition { stage: 1, position: 40, expect: exp(&shown, 1) },
+            Change::StageColor { stage: 1, color: Rgb { r: 1, g: 2, b: 3 }, expect: exp(&shown, 1) },
+            Change::CurrentStage { stage: 0, expect: exp(&shown, 2) },
+        ] {
+            let e = apply(&after_count, std::slice::from_ref(&queued)).unwrap_err();
+            assert!(e.contains("changed since it was shown"), "{queued:?}: {e}");
+        }
+        // On the settings the user saw, the same patch applies.
+        let typed = Change::StageDpi { stage: 1, dpi: 900, expect: exp(&shown, 1) };
+        assert_eq!(apply(&shown, &[typed]).unwrap().dpi_stages[1].value.dpi(), 900);
+    }
+
+    #[test]
+    fn stage_patches_need_a_well_formed_expectation() {
+        assert!(patch_err(r#"{"stageDpi": {"stage": 0, "dpi": 800}}"#).contains("'expect'"));
+        assert!(patch_err(r#"{"currentDpiStage": 1}"#).contains("must be an object"));
+        for bad in [
+            r##"{"reg": [7, 7], "color": "#ff0000"}"##,
+            r##"{"reg": [7, 7, 300], "color": "#ff0000"}"##,
+            r##"{"reg": [7, 7, 0], "color": "red"}"##,
+            r##"{"color": "#ff0000"}"##,
+            r#"[]"#,
+        ] {
+            let text = format!(r#"{{"stageDpi": {{"stage": 0, "dpi": 800, "expect": {bad}}}}}"#);
+            assert!(patch_err(&text).contains("'stageDpi.expect'"), "{bad}");
         }
     }
 
@@ -457,9 +547,10 @@ mod tests {
         assert!(patch_err(r#"{"lod": 300}"#).contains("'lod'"));
         assert!(patch_err(r#"{"stageDpi": 800}"#).contains("'stageDpi'"));
         assert!(patch_err(r#"{"stageDpi": {"dpi": 800}}"#).contains("'stage'"));
-        assert!(patch_err(r#"{"stageDpi": {"stage": 0, "dpi": 800, "x": 1}}"#).contains("'x'"));
-        assert!(patch_err(r##"{"stageColor": {"stage": 0, "color": "#fff"}}"##).contains("#rrggbb"));
-        assert!(patch_err(r##"{"stageColor": {"stage": 0, "color": "#gg0000"}}"##).contains("#rrggbb"));
+        let e = expect_json(&defaults(), 0);
+        assert!(patch_err(&format!(r#"{{"stageDpi": {{"stage": 0, "dpi": 800, {e}, "x": 1}}}}"#)).contains("'x'"));
+        assert!(patch_err(&format!(r##"{{"stageColor": {{"stage": 0, "color": "#fff", {e}}}}}"##)).contains("#rrggbb"));
+        assert!(patch_err(&format!(r##"{{"stageColor": {{"stage": 0, "color": "#gg0000", {e}}}}}"##)).contains("#rrggbb"));
     }
 
     #[test]

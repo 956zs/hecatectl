@@ -18,6 +18,12 @@ const QML_FILES: &[&str] = &[
     "qml/AppDialog.qml",
     "qml/PerformancePage.qml",
     "qml/BuiltinSettingsPage.qml",
+    "qml/KeySetPage.qml",
+    "qml/MacroPage.qml",
+    "qml/ChoiceGrid.qml",
+    "qml/KeyCaptureField.qml",
+    "qml/LoopChoice.qml",
+    "qml/NameDialog.qml",
 ];
 const QML_SINGLETONS: &[&str] = &["qml/Format.qml", "qml/Model.qml"];
 
@@ -28,7 +34,7 @@ fn main() {
         .chain(QML_SINGLETONS.iter().map(|f| QmlFile::from(*f).singleton(true)));
     let builder = CxxQtBuilder::new_qml_module(QmlModule::new("HecateGui").qml_files(files))
         .qt_module("Quick")
-        .files(["src/bridge/device.rs", "src/bridge/i18n.rs", "src/bridge/theme.rs"]);
+        .files(["src/bridge/device.rs", "src/bridge/i18n.rs", "src/bridge/macros.rs", "src/bridge/theme.rs"]);
     // SAFETY: only adds a warning flag. GCC 16 warns about QChar inside the Qt 6.11 headers.
     let builder = unsafe { builder.cc_builder(|cc| {
         cc.flag_if_supported("-Wno-sfinae-incomplete");
