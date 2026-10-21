@@ -60,6 +60,23 @@ Goal: Linux CLI to configure the HECATE G3M PRO 升級版 (updated) mouse, first
   `backup <file>`, `restore <file> [--dry-run]`. **Owner backup: ~/hecate-re/backup-2026-10-21.json** (1000 Hz,
   stages 500/950/1550/3800/7550/14100, HP, sensor sleep 15 min, volume keys); live dry-run vs. it = 0 writes.
   Unmodelled but valid groups seen live at 0x54 (3+c), 0x58, 0x5A, 0x5C, 0x5E, 0xBB: reported, never written.
+- ✅ core-settings agent, cross-process fix (not committed): flash replies must echo `[2..6]` (protocol::is_response_to);
+  re-entrant `flock(LOCK_EX|LOCK_NB)` per Device, 10 s bounded wait → "device busy", taken by every transact and held
+  across composite ops (`Mouse::exclusive` for callers: CLI pair loop, restore read→write→verify, Backup::take);
+  apply re-reads the block inside the lock and refuses if any group differs from `old` (settings::stale_groups).
+  Live: lock verified on /dev/hidraw1 with flock(1) (waits, then busy at 10 s); concurrent flash reads not yet
+  re-tested live (mouse asleep).
+- ✅ core-settings agent, phase 5 packaging (not committed): README.md (zh-TW summary + English), LICENSE (MIT, 956zs),
+  scripts/install.sh (`--dry-run`, `--uninstall`; release build at nice/ionice, ~/.local/bin + $XDG_DATA_HOME
+  desktop entry, icon only if data/hecate-gui.svg exists, prints the udev sudo command unless the identical rule is
+  installed, never runs sudo, refuses root, Cargo.lock never touched). Not run for real; dry runs only.
+- ✅ core-settings agent, review fixes R5/R6/R8 (not committed): R5 every CLI command resolves through find_devices
+  (`select_device`, canonicalized `--device`), `pair` only via the 2.4G receiver (`select_receiver`); R6 restore
+  drops hidden rate codes / stage count ∉ 1..=6 / active stage ≥ count → `SkipReason::Refused`, printed by the CLI;
+  R8 `require_online` waits only outside a lock (inside: one `08 03`, "went to sleep" error), composite ops wait
+  first, then re-check once inside the lock. Tests: explicit_device_must_be_a_detected_node, pair_requires_the_receiver,
+  restore_refuses_values_the_vendor_never_writes, restore_keeps_stage_count_and_active_stage_consistent,
+  require_online_inside_a_lock_checks_once (fails without the fix: 15 s), a_sleeping_mouse_does_not_hold_the_lock_while_waiting.
 - ✅ RE agent: docs/ui-features.md (vendor UI feature matrix for g3mpro_upgrades). Key: 4 tabs (KeySet, Performance
   Settings, Macro Management, Built-in Settings), no lighting page (only DPI stage colours); rates 125–1000 only; 5
   remappable keys = Keys[0..4]; units: sensorSleepTime/allLedOffTime = 10 s, LOD 1/2 = 1MM/2MM, macro delay = ms;
@@ -90,11 +107,24 @@ Goal: Linux CLI to configure the HECATE G3M PRO 升級版 (updated) mouse, first
   to lead; needs address matching / flock in core).
 - ✅ Phase 0 hardware validation (lead, 2026-10-21): full 0x100 read + `hecatectl show` work; flash had rate 08 4d
   (125 Hz); `hecatectl rate 1000` wrote `08 07 00 00 00 02 01 54 … ef`, ack + read-back 01 54 = 1000 Hz.
-- 🔄 core-settings: cross-process safety (echo match on 07/08, operation-scoped flock, stale-snapshot check in apply)
-- 🔄 gui-skeleton: phase 4 KeySet + Macro Management pages
-- ⏳ Live write tests (owner approved all four 2026-10-21; waiting for owner at the mouse, after the safety fix):
-  longrange on/off, slot_rewrite 3, reset + restore from ~/hecate-re/backup-2026-10-21.json, pairing (L+wheel+R 3 s)
-- ⏳ Owner: measure with /tmp/mouse-diag/rate.py while moving the mouse (expect ~1.00 ms intervals).
+- ✅ gui-skeleton: phase 4 KeySet + Macro Management pages (nav in vendor order). src/keymap.rs: KeyFunction ↔
+  (type,p1,p2) for every §3.2 category + Unknown, keys view (multimedia vs combination from shortcut slot i, macro
+  name/loop), left-click lock, assignment parsing and write plan (slot written+verified first, then the binding via
+  `Mouse::apply`, all in one `exclusive()`; unchanged slot/binding skipped). src/hid.rs: HID usages + evdev codes
+  (vendor key table names), modifiers, 18 multimedia usages. src/macro_name.rs: UTF-8→Big5 decode, Big5/UTF-8
+  encode (`macro_name_encoding`), 30-byte and unencodable checks. src/macro_lib.rs + bridge/macros.rs: PC-side
+  library (vendor model §3.4), one JSON per macro in `macro_dir` (default ~/.config/hecate-gui/macros), import from
+  device. Worker reads settings+slots+version+long range in one exclusive(). Live view: back/forward =
+  Volume Down/Up; device macros 切回去:D / 切螢幕:D (Ctrl+Win+Left/Right) import correctly. 104 gui tests.
+  Review fixes (gui): R3 editing off while busy + stage patches carry `expect {reg, color}` (refused on mismatch);
+  R2 slots always written whole + read back, binding skip only after an in-lock settings re-read matches; R1 online
+  polls compare flash 0x000..0x00A and re-read on change; R4 failed write/reset/read → loading state until a read
+  succeeds; R7 names decoded in `macro_name_encoding` first; R8 every exclusive() follows a fresh online check.
+  Desktop Exec forces `QT_QPA_PLATFORM=wayland;xcb`; original icon data/hecate-gui.svg. 110 gui tests.
+- ✅ Live write tests (owner present, 2026-10-21): long-distance on/off, slot 3 rewrite, factory reset (reply after
+  3.7 s; reset touches 6 groups only) + restore from backup (6 writes verified), receiver pairing (status 3). Report
+  rate measured 1.01 ms median = 1000 Hz.
+- ✅ Review R1–R8 fixed; phase 4 (KeySet + Macro Management) committed.
 
 ## Rules
 - No builds while the owner is playing osu! (check `osu-state` / `hyprctl activewindow -j`); build with nice -n 19 ionice -c3.
