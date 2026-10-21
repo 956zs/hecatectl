@@ -13,6 +13,7 @@ pub const VENDOR_ID: u16 = 0x35bb;
 pub const PRODUCT_IDS: [(u16, &str); 2] = [(0xd3fb, "2.4G receiver"), (0xd3fc, "wired")];
 /// Vendor usage page that carries the 0x08 config report.
 const CONFIG_USAGE_PAGE: u16 = 0xff02;
+const HIDRAW_SYSFS: &str = "/sys/class/hidraw";
 
 /// The vendor library uses 2 tries x 200 ms but retries whole operations at a higher level.
 /// Over 2.4G, replies are occasionally late or lost while the mouse drifts in and out of sleep
@@ -25,12 +26,14 @@ pub struct DeviceInfo {
     pub node: PathBuf,
     pub product_id: u16,
     pub kind: &'static str,
+    /// USB bcdDevice of the receiver or cable, shown by the vendor as the receiver firmware (FUN_1400fa0c0).
+    pub receiver_version: Option<u16>,
 }
 
 /// Lists hidraw nodes that belong to a supported mouse and expose the config report.
 pub fn find_devices() -> Vec<DeviceInfo> {
     let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir("/sys/class/hidraw") else { return out };
+    let Ok(entries) = fs::read_dir(HIDRAW_SYSFS) else { return out };
     for e in entries.flatten() {
         let sys = e.path();
         let Ok(uevent) = fs::read_to_string(sys.join("device/uevent")) else { continue };
@@ -43,10 +46,30 @@ pub fn find_devices() -> Vec<DeviceInfo> {
         if !report_ids_on_page(&desc, CONFIG_USAGE_PAGE).contains(&protocol::REPORT_ID) {
             continue;
         }
-        out.push(DeviceInfo { node: Path::new("/dev").join(e.file_name()), product_id: pid, kind });
+        let receiver_version = read_bcd_device(&sys);
+        out.push(DeviceInfo { node: Path::new("/dev").join(e.file_name()), product_id: pid, kind, receiver_version });
     }
     out.sort_by(|a, b| a.node.cmp(&b.node));
     out
+}
+
+/// USB bcdDevice for a hidraw node such as `/dev/hidraw1`.
+pub fn receiver_version(node: &Path) -> Option<u16> {
+    read_bcd_device(&Path::new(HIDRAW_SYSFS).join(node.file_name()?))
+}
+
+/// `<hidraw sysfs dir>/device` is the HID device; its parent is the USB interface, whose parent is the USB device.
+fn read_bcd_device(sys: &Path) -> Option<u16> {
+    parse_bcd_device(&fs::read_to_string(sys.join("device/../../bcdDevice")).ok()?)
+}
+
+/// Parses sysfs `bcdDevice` (`"0102\n"`, hex).
+pub fn parse_bcd_device(s: &str) -> Option<u16> {
+    let s = s.trim();
+    if s.is_empty() || s.len() > 4 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u16::from_str_radix(s, 16).ok()
 }
 
 /// Parses `HID_ID=0003:000035BB:0000D3FB` from a hidraw uevent.
@@ -223,6 +246,19 @@ mod tests {
     fn parses_hid_id() {
         let ue = "DRIVER=hid-generic\nHID_ID=0003:000035BB:0000D3FB\nHID_NAME=HECATE\n";
         assert_eq!(parse_hid_id(ue), Some((0x35bb, 0xd3fb)));
+    }
+
+    #[test]
+    fn parses_bcd_device() {
+        assert_eq!(parse_bcd_device("0102\n"), Some(0x0102)); // live receiver
+        assert_eq!(parse_bcd_device("0000"), Some(0));
+        assert_eq!(parse_bcd_device("ffff"), Some(0xffff));
+        assert_eq!(parse_bcd_device("1"), Some(1));
+        assert_eq!(parse_bcd_device(""), None);
+        assert_eq!(parse_bcd_device("\n"), None);
+        assert_eq!(parse_bcd_device("10000"), None);
+        assert_eq!(parse_bcd_device("+102"), None);
+        assert_eq!(parse_bcd_device("01g2"), None);
     }
 
     #[test]

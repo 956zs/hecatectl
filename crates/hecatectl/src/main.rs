@@ -1,19 +1,26 @@
 use hecate_core::mouse::{self, Mouse};
+use hecate_core::protocol::{self, PairingStatus};
 use hecate_core::settings::{self, Checked, KeyBinding, Settings};
-use hecate_core::{hidraw, protocol};
+use hecate_core::slots::{self, KeyState, Slots};
+use hecate_core::hidraw;
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: hecatectl [--device /dev/hidrawN] <command>
 
 commands:
-  list            show detected mice and their hidraw nodes
-  info            connection, firmware version, battery and report rate
-  rate            show the report (polling) rate
-  rate <HZ>       set the report rate: 125, 250, 500 or 1000
-  dump            hex dump of the settings block (flash 0x000-0x0ff, read-only)
-  show            decoded settings block (read-only)";
+  list              show detected mice and their hidraw nodes
+  info              connection, firmware and receiver versions, battery and report rate
+  rate              show the report (polling) rate
+  rate <HZ>         set the report rate: 125, 250, 500 or 1000
+  dump              hex dump of the settings block (flash 0x000-0x0ff, read-only)
+  show              decoded settings block (read-only)
+  slots             decoded shortcut and macro slots (read-only)
+  longrange         show the long-distance mode
+  longrange on|off  set the long-distance mode
+  reset --yes       factory reset: all settings, key mappings and macros
+  pair --yes        put the receiver into pairing mode and wait for the mouse";
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1).collect()) {
@@ -30,11 +37,25 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.as_slice() {
         ["list"] => cmd_list(),
-        ["info"] => cmd_info(&mut open(device)?),
+        ["info"] => {
+            let node = resolve_node(device)?;
+            cmd_info(&mut open_node(&node)?, hidraw::receiver_version(&node))
+        }
         ["rate"] => cmd_rate_get(&mut open(device)?),
         ["rate", hz] => cmd_rate_set(&mut open(device)?, hz),
         ["dump"] => cmd_dump(&mut open(device)?),
         ["show"] => cmd_show(&mut open(device)?),
+        ["slots"] => cmd_slots(&mut open(device)?),
+        ["longrange"] => cmd_long_range(&mut open(device)?, None),
+        ["longrange", v] => cmd_long_range(&mut open(device)?, Some(parse_on_off(v)?)),
+        ["reset", "--yes"] => cmd_reset(&mut open(device)?),
+        ["reset"] => Err("factory reset erases all settings, key mappings and macros on the mouse; \
+                          run 'hecatectl reset --yes' to do it"
+            .into()),
+        ["pair", "--yes"] => cmd_pair(&mut open(device)?),
+        ["pair"] => Err("pairing puts the receiver into pairing mode and replaces its current link; \
+                         run 'hecatectl pair --yes' to do it"
+            .into()),
         [] | ["-h" | "--help" | "help"] => {
             println!("{USAGE}");
             Ok(())
@@ -53,22 +74,27 @@ fn take_device_arg(args: &mut Vec<String>) -> Result<Option<PathBuf>, String> {
     Ok(Some(PathBuf::from(path)))
 }
 
-fn open(device: Option<PathBuf>) -> Result<Mouse, String> {
-    let node = match device {
-        Some(p) => p,
-        None => {
-            let devs = hidraw::find_devices();
-            match devs.as_slice() {
-                [] => return Err("no HECATE G3M PRO (updated) found".into()),
-                [one] => one.node.clone(),
-                many => {
-                    let nodes: Vec<String> = many.iter().map(|d| format!("{} ({})", d.node.display(), d.kind)).collect();
-                    return Err(format!("several mice found, pick one with --device: {}", nodes.join(", ")));
-                }
-            }
+fn resolve_node(device: Option<PathBuf>) -> Result<PathBuf, String> {
+    if let Some(p) = device {
+        return Ok(p);
+    }
+    let devs = hidraw::find_devices();
+    match devs.as_slice() {
+        [] => Err("no HECATE G3M PRO (updated) found".into()),
+        [one] => Ok(one.node.clone()),
+        many => {
+            let nodes: Vec<String> = many.iter().map(|d| format!("{} ({})", d.node.display(), d.kind)).collect();
+            Err(format!("several mice found, pick one with --device: {}", nodes.join(", ")))
         }
-    };
-    Ok(Mouse::new(hidraw::Device::open(&node)?))
+    }
+}
+
+fn open_node(node: &Path) -> Result<Mouse, String> {
+    Ok(Mouse::new(hidraw::Device::open(node)?))
+}
+
+fn open(device: Option<PathBuf>) -> Result<Mouse, String> {
+    open_node(&resolve_node(device)?)
 }
 
 fn cmd_list() -> Result<(), String> {
@@ -77,15 +103,29 @@ fn cmd_list() -> Result<(), String> {
         return Err("no HECATE G3M PRO (updated) found".into());
     }
     for d in devs {
-        println!("{}  {:04x}:{:04x}  {}", d.node.display(), hidraw::VENDOR_ID, d.product_id, d.kind);
+        println!(
+            "{}  {:04x}:{:04x}  {}  receiver {}",
+            d.node.display(),
+            hidraw::VENDOR_ID,
+            d.product_id,
+            d.kind,
+            version_text(d.receiver_version)
+        );
     }
     Ok(())
 }
 
-fn cmd_info(m: &mut Mouse) -> Result<(), String> {
+fn version_text(v: Option<u16>) -> String {
+    match v {
+        Some(v) => format!("{} (0x{v:04x})", protocol::format_version(v)),
+        None => "unknown".into(),
+    }
+}
+
+fn cmd_info(m: &mut Mouse, receiver: Option<u16>) -> Result<(), String> {
     m.require_online()?;
-    let v = m.version()?;
-    println!("firmware:    0x{v:04x}");
+    println!("firmware:    {}", version_text(Some(m.version()?)));
+    println!("receiver:    {}", version_text(receiver));
     let b = m.battery()?;
     println!(
         "battery:     {}%{} ({} mV)",
@@ -194,8 +234,7 @@ fn format_settings(s: &Settings) -> String {
     row(&mut out, "wheel changes DPI", s.wheel_changes_dpi.value, &s.wheel_changes_dpi);
     row(&mut out, "fury mode", s.fury_mode.value, &s.fury_mode);
     for (i, key) in s.keys.iter().enumerate() {
-        let name = KEY_NAMES.get(i).map_or_else(|| format!("key {}", i + 1), |n| n.to_string());
-        row(&mut out, &name, describe_key(&key.value), key);
+        row(&mut out, &key_name(i), describe_key(&key.value), key);
     }
     out
 }
@@ -251,6 +290,125 @@ fn describe_key(k: &KeyBinding) -> String {
         Some(t) => format!("{t}  {raw}"),
         None => format!("unknown function  {raw}"),
     }
+}
+
+fn key_name(i: usize) -> String {
+    KEY_NAMES.get(i).map_or_else(|| format!("key {}", i + 1), |n| n.to_string())
+}
+
+fn parse_on_off(v: &str) -> Result<bool, String> {
+    match v {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(format!("'{v}' is not on or off")),
+    }
+}
+
+fn cmd_long_range(m: &mut Mouse, set: Option<bool>) -> Result<(), String> {
+    m.require_online()?;
+    if let Some(on) = set {
+        m.set_long_range(on)?;
+    }
+    println!("long-distance mode: {}", if m.long_range()? { "on" } else { "off" });
+    Ok(())
+}
+
+fn cmd_reset(m: &mut Mouse) -> Result<(), String> {
+    m.require_online()?;
+    m.factory_reset()?;
+    println!("The device has returned to its default settings.");
+    Ok(())
+}
+
+/// Vendor RepairDongle (HECATE FUN_1400fc730 / FUN_1400f87c0): StartPair, whose result is ignored, then poll
+/// the status every 200 ms: 3 succeeds, 0 or 2 or no answer fails, more than 100 retries fails.
+fn cmd_pair(m: &mut Mouse) -> Result<(), String> {
+    const FAILED: &str = "Pairing failed, please make sure both the device and the dongle are properly connected.";
+    if let Err(e) = m.start_pairing() {
+        eprintln!("start pairing: {e} (polling anyway, like the vendor app)");
+    }
+    println!("pairing started: put the mouse into pairing mode...");
+    for poll in 0..=mouse::PAIRING_POLLS {
+        match m.pairing_status() {
+            Ok(PairingStatus::Paired) => {
+                println!("Pairing success!");
+                return Ok(());
+            }
+            Ok(PairingStatus::Failed) => return Err(FAILED.into()),
+            Err(e) => return Err(format!("{FAILED} ({e})")),
+            Ok(PairingStatus::InProgress(_)) => {}
+        }
+        if poll < mouse::PAIRING_POLLS {
+            std::thread::sleep(mouse::PAIRING_POLL_INTERVAL);
+        }
+    }
+    Err(format!("{FAILED} (timed out)"))
+}
+
+fn cmd_slots(m: &mut Mouse) -> Result<(), String> {
+    print!("{}", format_slots(&m.read_slots()?));
+    Ok(())
+}
+
+/// Used slots only. Slot i is played by Keys[i] (type 5 = shortcut, type 6 = macro).
+fn format_slots(s: &Slots) -> String {
+    let mut out = String::new();
+    for (i, sc) in s.shortcuts.iter().enumerate() {
+        let Some(sc) = sc else { continue };
+        let events: Vec<String> = sc.events.iter().map(|e| describe_event(e.state, e.kind, e.code)).collect();
+        writeln!(out, "shortcut slot {i} ({}): {}", key_name(i), events.join(", ")).expect("write to String");
+    }
+    for (j, mc) in s.macros.iter().enumerate() {
+        let Some(mc) = mc else { continue };
+        let name = mc.name.escape_ascii();
+        writeln!(out, "macro slot {j} ({}) \"{name}\", {} events:", key_name(j), mc.events.len()).expect("write to String");
+        for e in &mc.events {
+            writeln!(out, "    {}, {} ms", describe_event(e.state, e.kind, e.code), e.delay_ms).expect("write to String");
+        }
+    }
+    let shortcuts = s.shortcuts.iter().flatten().count();
+    let macros = s.macros.iter().flatten().count();
+    writeln!(out, "{shortcuts} of {} shortcut slots and {macros} of {} macro slots in use", slots::SLOTS, slots::SLOTS)
+        .expect("write to String");
+    out
+}
+
+/// Event per docs/ui-features.md §3.3.
+fn describe_event(state: KeyState, kind: u8, code: u16) -> String {
+    let state = match state {
+        KeyState::Down => "down",
+        KeyState::Up => "up",
+        KeyState::Other => "other",
+    };
+    let what = match kind {
+        slots::EVENT_MODIFIER => format!("modifier {}", modifier_names(code)),
+        slots::EVENT_KEY => format!("key 0x{code:02x}"),
+        slots::EVENT_CONSUMER => format!("consumer 0x{code:04x}"),
+        slots::EVENT_MOUSE => match code {
+            1 => "mouse left".into(),
+            2 => "mouse right".into(),
+            4 => "mouse middle".into(),
+            8 => "mouse back".into(),
+            16 => "mouse forward".into(),
+            _ => format!("mouse buttons 0x{code:02x}"),
+        },
+        _ => format!("type {kind} code 0x{code:04x}"),
+    };
+    format!("{state} {what}")
+}
+
+/// Modifier mask bits from the vendor table (FUN_14000bab0); other bits are shown in hex.
+fn modifier_names(mask: u16) -> String {
+    let mut names: Vec<String> = [(0x01, "LCtrl"), (0x02, "LShift"), (0x04, "LAlt"), (0x08, "LWin")]
+        .iter()
+        .filter(|(bit, _)| mask & bit != 0)
+        .map(|(_, n)| n.to_string())
+        .collect();
+    let rest = mask & !0x0F;
+    if rest != 0 || names.is_empty() {
+        names.push(format!("0x{rest:02x}"));
+    }
+    names.join("+")
 }
 
 #[cfg(test)]
@@ -334,5 +492,69 @@ mod tests {
         assert_eq!(d(1, 3, 0), "unknown function  [1 3 0]");
         assert_eq!(d(2, 0, 0), "unknown function  [2 0 0]");
         assert_eq!(d(0xFF, 0xFF, 0xFF), "unknown function  [255 255 255]");
+    }
+
+    #[test]
+    fn on_off_arguments() {
+        assert_eq!(parse_on_off("on"), Ok(true));
+        assert_eq!(parse_on_off("off"), Ok(false));
+        assert!(parse_on_off("").is_err());
+        assert!(parse_on_off("ON").is_err());
+        assert!(parse_on_off("1").is_err());
+    }
+
+    #[test]
+    fn version_texts() {
+        assert_eq!(version_text(Some(0x0313)), "v3.19 (0x0313)");
+        assert_eq!(version_text(Some(0)), "v0.00 (0x0000)");
+        assert_eq!(version_text(None), "unknown");
+    }
+
+    #[test]
+    fn key_names() {
+        assert_eq!(key_name(0), "left button");
+        assert_eq!(key_name(5), "DPI button");
+        assert_eq!(key_name(6), "key 7");
+        assert_eq!(key_name(15), "key 16");
+    }
+
+    #[test]
+    fn event_descriptions() {
+        assert_eq!(describe_event(KeyState::Down, slots::EVENT_CONSUMER, 0x00E9), "down consumer 0x00e9");
+        assert_eq!(describe_event(KeyState::Up, slots::EVENT_KEY, 0x06), "up key 0x06");
+        assert_eq!(describe_event(KeyState::Down, slots::EVENT_MODIFIER, 0x03), "down modifier LCtrl+LShift");
+        assert_eq!(describe_event(KeyState::Down, slots::EVENT_MOUSE, 1), "down mouse left");
+        assert_eq!(describe_event(KeyState::Up, slots::EVENT_MOUSE, 3), "up mouse buttons 0x03");
+        assert_eq!(describe_event(KeyState::Other, 9, 0xBEEF), "other type 9 code 0xbeef");
+    }
+
+    #[test]
+    fn modifier_masks() {
+        assert_eq!(modifier_names(0x0F), "LCtrl+LShift+LAlt+LWin");
+        assert_eq!(modifier_names(0x08), "LWin");
+        assert_eq!(modifier_names(0x00), "0x00");
+        assert_eq!(modifier_names(0x11), "LCtrl+0x10");
+        assert_eq!(modifier_names(0xFFF0), "0xfff0");
+    }
+
+    #[test]
+    fn slot_listing() {
+        assert_eq!(format_slots(&Slots::default()), "0 of 16 shortcut slots and 0 of 16 macro slots in use\n");
+        let mut s = Slots::default();
+        s.shortcuts[0] = Some(slots::Shortcut::multimedia(0x00E9));
+        s.macros[6] = Some(slots::Macro {
+            name: vec![b'a', 0xE5],
+            events: vec![
+                slots::MacroEvent { state: KeyState::Down, kind: slots::EVENT_KEY, code: 4, delay_ms: 50 },
+                slots::MacroEvent { state: KeyState::Up, kind: slots::EVENT_KEY, code: 4, delay_ms: 0 },
+            ],
+        });
+        let text = format_slots(&s);
+        assert_eq!(
+            text,
+            "shortcut slot 0 (left button): down consumer 0x00e9, up consumer 0x00e9\n\
+             macro slot 6 (key 7) \"a\\xe5\", 2 events:\n    down key 0x04, 50 ms\n    up key 0x04, 0 ms\n\
+             1 of 16 shortcut slots and 1 of 16 macro slots in use\n"
+        );
     }
 }

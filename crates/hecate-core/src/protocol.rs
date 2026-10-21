@@ -11,9 +11,14 @@ const CHECKSUM_BASE: u8 = 0x55;
 
 pub const CMD_ONLINE: u8 = 0x03;
 pub const CMD_BATTERY: u8 = 0x04;
+pub const CMD_START_PAIR: u8 = 0x05;
+pub const CMD_PAIRING_STATUS: u8 = 0x06;
 pub const CMD_FLASH_WRITE: u8 = 0x07;
 pub const CMD_FLASH_READ: u8 = 0x08;
+pub const CMD_CLEAR_SETTING: u8 = 0x09;
 pub const CMD_VERSION: u8 = 0x12;
+pub const CMD_SET_LONG_RANGE: u8 = 0x16;
+pub const CMD_GET_LONG_RANGE: u8 = 0x17;
 
 /// Data bytes carried by one flash read/write packet (resp[6..16] / req[6..16]).
 pub const FLASH_CHUNK: usize = 10;
@@ -126,6 +131,44 @@ pub fn parse_battery(resp: &Packet) -> Battery {
 /// Firmware version: `[6] << 8 | [7]` (FUN_1800160c0).
 pub fn parse_version(resp: &Packet) -> u16 {
     u16::from_be_bytes([resp[6], resp[7]])
+}
+
+/// A version as the vendor shows it: `v{hi}.0{lo}` when lo < 16, else `v{hi}.{lo}`, both decimal
+/// (HECATE.exe FUN_140243840). Used for the mouse (cmd 0x12) and the receiver (USB bcdDevice).
+pub fn format_version(v: u16) -> String {
+    let [hi, lo] = v.to_be_bytes();
+    if lo < 16 {
+        format!("v{hi}.0{lo}")
+    } else {
+        format!("v{hi}.{lo}")
+    }
+}
+
+/// `08 16 00 00 00 0A on` (UsbMouse_SetLongRangeMode @0x180012730). The reply must echo `on` at [6].
+pub fn set_long_range_request(on: bool) -> Packet {
+    build(CMD_SET_LONG_RANGE, &[0, 0, 0, 0x0A, u8::from(on)]).expect("fixed-size body")
+}
+
+/// `08 05 00 00 00 02`: puts the receiver into pairing mode (FUN_180015f60).
+pub fn start_pair_request() -> Packet {
+    build(CMD_START_PAIR, &[0, 0, 0, 0x02]).expect("fixed-size body")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairingStatus {
+    Paired,
+    Failed,
+    /// Any other status byte: still pairing.
+    InProgress(u8),
+}
+
+/// `08 06` reply byte [6]: 3 = paired, 0 or 2 = failed, anything else = in progress (HECATE FUN_1400f87c0).
+pub fn parse_pairing_status(resp: &Packet) -> PairingStatus {
+    match resp[DATA_OFFSET] {
+        3 => PairingStatus::Paired,
+        0 | 2 => PairingStatus::Failed,
+        s => PairingStatus::InProgress(s),
+    }
 }
 
 #[cfg(test)]
@@ -264,5 +307,43 @@ mod tests {
         assert_eq!(parse_battery(&empty), Battery { percent: 0, charging: false, millivolts: 0 });
         let ver = build(CMD_VERSION, &[0, 0, 0, 0, 0x01, 0x23]).unwrap();
         assert_eq!(parse_version(&ver), 0x0123);
+    }
+
+    #[test]
+    fn formats_versions_like_the_vendor() {
+        assert_eq!(format_version(0x0313), "v3.19"); // live mouse firmware
+        assert_eq!(format_version(0x0102), "v1.02"); // live receiver bcdDevice
+        assert_eq!(format_version(0x0000), "v0.00");
+        assert_eq!(format_version(0x030F), "v3.015"); // lo < 16 gets the "0" even when it has two digits
+        assert_eq!(format_version(0x0310), "v3.16");
+        assert_eq!(format_version(0xFFFF), "v255.255");
+    }
+
+    #[test]
+    fn device_action_packets_match_vendor() {
+        let mut on = hex("08 16 00 00 00 0A 01 00 00 00 00 00 00 00 00 00 00");
+        on[16] = checksum(&on[..16]);
+        assert_eq!(set_long_range_request(true).to_vec(), on);
+        assert_eq!(set_long_range_request(false)[6], 0);
+        assert_eq!(set_long_range_request(false)[16], checksum(&set_long_range_request(false)[..16]));
+        assert_eq!(start_pair_request()[..7], [0x08, 0x05, 0, 0, 0, 0x02, 0]);
+        assert_eq!(start_pair_request()[16], 0x55u8.wrapping_sub(0x08 + 0x05 + 0x02));
+        // ready-made packets in docs/protocol.md §6
+        let get_long_range = hex("08 17 00 00 00 00 00 00 00 00 00 00 00 00 00 00 36");
+        assert_eq!(build(CMD_GET_LONG_RANGE, &[]).unwrap().to_vec(), get_long_range);
+        let pairing_status = hex("08 06 00 00 00 00 00 00 00 00 00 00 00 00 00 00 47");
+        assert_eq!(build(CMD_PAIRING_STATUS, &[]).unwrap().to_vec(), pairing_status);
+        assert_eq!(build(CMD_CLEAR_SETTING, &[]).unwrap()[..2], [0x08, 0x09]);
+    }
+
+    #[test]
+    fn parses_pairing_status() {
+        let status = |s: u8| parse_pairing_status(&build(CMD_PAIRING_STATUS, &[0, 0, 0, 0, s]).unwrap());
+        assert_eq!(status(3), PairingStatus::Paired);
+        assert_eq!(status(0), PairingStatus::Failed);
+        assert_eq!(status(2), PairingStatus::Failed);
+        assert_eq!(status(1), PairingStatus::InProgress(1));
+        assert_eq!(status(4), PairingStatus::InProgress(4));
+        assert_eq!(status(0xFF), PairingStatus::InProgress(0xFF));
     }
 }
