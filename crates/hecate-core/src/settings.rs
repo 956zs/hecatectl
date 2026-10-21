@@ -27,8 +27,9 @@ const DPI_LOW_RANGE_MAX: u32 = 26000;
 /// Values the UI writes (HECATE.exe handlers).
 const LOD_CHOICES: [u8; 2] = [1, 2]; // FUN_140237fd0
 const LED_OFF_TIME_CHOICES: [u8; 8] = [6, 30, 60, 90, 120, 150, 180, 210]; // FUN_140242ba0
-/// FUN_140231ec0: index 4 (60) falls through to 90, so 60 is never written.
-const SLEEP_TIME_CHOICES: [u8; 5] = [3, 6, 12, 30, 90];
+/// FUN_140231ec0 labels: 30s, 1, 2, 5, 10, 15 min. Its index 4 (10 min = 60) falls through and
+/// writes 90 (vendor bug); we write the labelled value.
+const SLEEP_TIME_CHOICES: [u8; 6] = [3, 6, 12, 30, 60, 90];
 const POWER_MODE_CHOICES: [u8; 2] = [POWER_LP, POWER_HP]; // FUN_140237ee0
 
 pub const POWER_LP: u8 = 0;
@@ -865,7 +866,8 @@ mod tests {
         assert!(with(|s| s.lod.set(1)).is_ok());
         assert!(with(|s| s.all_led_off_time.set(7)).is_err());
         assert!(with(|s| s.all_led_off_time.set(210)).is_ok());
-        assert!(with(|s| s.sensor_sleep_time.set(60)).is_err());
+        assert!(with(|s| s.sensor_sleep_time.set(60)).is_ok());
+        assert!(with(|s| s.sensor_sleep_time.set(45)).is_err());
         assert!(with(|s| s.sensor_sleep_time.set(90)).is_ok());
         assert!(with(|s| s.power_mode.set(2)).is_err());
         assert!(with(|s| s.power_mode.set(POWER_HP)).is_ok());
