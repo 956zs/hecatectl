@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 pub const VENDOR_ID: u16 = 0x35bb;
 /// 2.4 GHz receiver and wired (USB-C) product IDs of the G3M PRO updated version.
-pub const PRODUCT_IDS: [(u16, &str); 2] = [(0xd3fb, "2.4G receiver"), (0xd3fc, "wired")];
+pub const RECEIVER_PID: u16 = 0xd3fb;
+pub const WIRED_PID: u16 = 0xd3fc;
+pub const PRODUCT_IDS: [(u16, &str); 2] = [(RECEIVER_PID, "2.4G receiver"), (WIRED_PID, "wired")];
 /// Vendor usage page that carries the 0x08 config report.
 const CONFIG_USAGE_PAGE: u16 = 0xff02;
 const HIDRAW_SYSFS: &str = "/sys/class/hidraw";
@@ -28,6 +30,13 @@ pub struct DeviceInfo {
     pub kind: &'static str,
     /// USB bcdDevice of the receiver or cable, shown by the vendor as the receiver firmware (FUN_1400fa0c0).
     pub receiver_version: Option<u16>,
+}
+
+impl DeviceInfo {
+    /// The 2.4 GHz receiver, the only connection the vendor pairs through (RepairDongle, ui-features §6.2).
+    pub fn is_receiver(&self) -> bool {
+        self.product_id == RECEIVER_PID
+    }
 }
 
 /// Lists hidraw nodes that belong to a supported mouse and expose the config report.
@@ -225,6 +234,16 @@ impl Device {
         }
     }
 
+    /// Whether this Device is inside a locked operation.
+    pub fn is_locked(&self) -> bool {
+        !self.lock.needs_os_lock()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_lock_wait(&mut self, wait: Duration) {
+        self.lock_wait = wait;
+    }
+
     /// Sends `req` and waits for the matching response, like the vendor library does.
     pub fn transact(&mut self, req: &Packet) -> Result<Packet, String> {
         self.transact_with(req, TRIES, TIMEOUT)
@@ -361,6 +380,19 @@ mod tests {
     }
 
     #[test]
+    fn receiver_is_identified_by_product_id() {
+        let info = |product_id| DeviceInfo {
+            node: PathBuf::from("/dev/hidraw1"),
+            product_id,
+            kind: "",
+            receiver_version: None,
+        };
+        assert!(info(RECEIVER_PID).is_receiver());
+        assert!(!info(WIRED_PID).is_receiver());
+        assert!(!info(0).is_receiver());
+    }
+
+    #[test]
     fn lock_depth_counts_nesting() {
         let mut d = LockDepth::default();
         assert!(d.needs_os_lock());
@@ -403,12 +435,15 @@ mod tests {
         let path = temp_file("dev");
         let (mut a, mut b) = (Device::open(&path).unwrap(), Device::open(&path).unwrap());
         b.lock_wait = Duration::from_millis(30);
+        assert!(!a.is_locked());
         a.lock().unwrap();
         a.lock().unwrap(); // a composite operation calling another one
+        assert!(a.is_locked() && !b.is_locked());
         assert!(b.lock().is_err());
         a.unlock();
         assert!(b.lock().is_err(), "inner unlock must not release the lock");
         a.unlock();
+        assert!(!a.is_locked());
         assert_eq!(b.lock(), Ok(()));
         a.lock_wait = Duration::from_millis(30);
         assert!(a.lock().is_err(), "now the other side holds it");

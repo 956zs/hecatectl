@@ -20,11 +20,12 @@ pub const PAIRING_POLLS: u32 = 100;
 
 pub struct Mouse {
     dev: Device,
+    wake_wait: Duration,
 }
 
 impl Mouse {
     pub fn new(dev: Device) -> Self {
-        Self { dev }
+        Self { dev, wake_wait: WAKE_WAIT }
     }
 
     /// Runs `f` with the device lock held, so the whole sequence is one operation for other processes
@@ -37,20 +38,35 @@ impl Mouse {
         result
     }
 
+    /// Waits for the mouse outside the lock (`require_online`), then runs `f` as one locked operation
+    /// that starts with a single online check.
+    fn online_exclusive<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, String>) -> Result<T, String> {
+        self.require_online()?;
+        self.exclusive(|m| {
+            m.require_online()?;
+            f(m)
+        })
+    }
+
     /// `08 03`: whether the mouse is connected (through the receiver or the cable).
     pub fn online(&mut self) -> Result<bool, String> {
         let resp = self.dev.transact(&p::build(p::CMD_ONLINE, &[])?)?;
         Ok(resp[p::DATA_OFFSET] != 0)
     }
 
-    /// Waits up to WAKE_WAIT for a sleeping mouse to come online. Each poll locks on its own, so a
-    /// sleeping mouse does not block other processes.
+    /// Waits up to 15 s for a sleeping mouse to come online. Each poll locks on its own, so a sleeping
+    /// mouse does not block other processes. Inside a locked operation (`exclusive`) it does not wait:
+    /// one `08 03`, and an error if the mouse is asleep, because waiting there would keep other
+    /// processes out for longer than their lock wait.
     pub fn require_online(&mut self) -> Result<(), String> {
         if self.online()? {
             return Ok(());
         }
+        if self.dev.is_locked() {
+            return Err("the mouse went to sleep during the operation; move it and try again".into());
+        }
         eprintln!("mouse is asleep, move it to wake it up...");
-        let deadline = Instant::now() + WAKE_WAIT;
+        let deadline = Instant::now() + self.wake_wait;
         while Instant::now() < deadline {
             std::thread::sleep(WAKE_POLL);
             if self.online()? {
@@ -59,7 +75,7 @@ impl Mouse {
         }
         Err(format!(
             "the receiver answers but the mouse stayed offline for {} s (is it switched on and in 2.4G mode?)",
-            WAKE_WAIT.as_secs()
+            self.wake_wait.as_secs()
         ))
     }
 
@@ -115,8 +131,7 @@ impl Mouse {
             let allowed: Vec<String> = p::SETTABLE_RATES.iter().map(|(r, _)| r.to_string()).collect();
             format!("unsupported rate {hz} Hz (allowed: {})", allowed.join(", "))
         })?;
-        self.require_online()?;
-        self.exclusive(|m| {
+        self.online_exclusive(|m| {
             if m.report_rate_code()? == Some(code) {
                 return Ok(false);
             }
@@ -133,8 +148,7 @@ impl Mouse {
 
     /// Online check, then the whole settings block (flash 0x000-0x0FF), decoded.
     pub fn read_settings(&mut self) -> Result<Settings, String> {
-        self.require_online()?;
-        self.read_block()
+        self.online_exclusive(Self::read_block)
     }
 
     fn read_block(&mut self) -> Result<Settings, String> {
@@ -157,8 +171,7 @@ impl Mouse {
         if writes.is_empty() {
             return Ok(old.clone());
         }
-        self.require_online()?;
-        self.exclusive(|m| {
+        self.online_exclusive(|m| {
             let stale = settings::stale_groups(old, &m.read_block()?);
             if !stale.is_empty() {
                 let at: Vec<String> = stale.iter().map(|r| format!("0x{:02x}", r.start)).collect();
@@ -217,8 +230,7 @@ impl Mouse {
     /// All 16 shortcut and 16 macro slots, in the vendor's read order (FUN_180013a20): every size
     /// probe first, then the bodies of the slots in use. Unused or corrupt slots are None.
     pub fn read_slots(&mut self) -> Result<Slots, String> {
-        self.require_online()?;
-        self.exclusive(|m| {
+        self.online_exclusive(|m| {
             let mut shortcut_len = [0; SLOTS];
             for (i, len) in shortcut_len.iter_mut().enumerate() {
                 *len = slots::shortcut_len(m.read_flash(slots::shortcut_addr(i)?, 1)?[0]);
@@ -244,8 +256,7 @@ impl Mouse {
     pub fn write_shortcut(&mut self, i: usize, s: &Shortcut) -> Result<(), String> {
         let addr = slots::shortcut_addr(i)?;
         let bytes = s.encode()?;
-        self.require_online()?;
-        self.exclusive(|m| m.write_verified(addr, &bytes))
+        self.online_exclusive(|m| m.write_verified(addr, &bytes))
     }
 
     /// Writes macro slot `j` whole (FUN_180006a70 format), then reads it back and compares, in one
@@ -253,15 +264,13 @@ impl Mouse {
     pub fn write_macro(&mut self, j: usize, m: &Macro) -> Result<(), String> {
         let addr = slots::macro_addr(j)?;
         let bytes = m.encode()?;
-        self.require_online()?;
-        self.exclusive(|mouse| mouse.write_verified(addr, &bytes))
+        self.online_exclusive(|mouse| mouse.write_verified(addr, &bytes))
     }
 
     /// Raw flash 0x0000..0x1B00: the settings block, then the whole shortcut area, then the whole macro
     /// area, in the vendor's area order (FUN_180013a20) but including unused slot bytes.
     pub fn read_image(&mut self) -> Result<Vec<u8>, String> {
-        self.require_online()?;
-        self.exclusive(|m| {
+        self.online_exclusive(|m| {
             let areas = [(0, p::CONFIG_BLOCK_LEN), (0x100, 0x200), (0x300, slots::USED_FLASH_LEN - 0x300)];
             let mut image = Vec::with_capacity(slots::USED_FLASH_LEN);
             for (addr, len) in areas {
@@ -276,8 +285,7 @@ impl Mouse {
     /// must come from a `read_image` inside the same `exclusive` section.
     pub fn restore(&mut self, plan: &RestorePlan) -> Result<(), String> {
         backup::check_writes(&plan.writes)?;
-        self.require_online()?;
-        self.exclusive(|m| plan.writes.iter().try_for_each(|w| m.write_verified(w.addr, &w.bytes)))
+        self.online_exclusive(|m| plan.writes.iter().try_for_each(|w| m.write_verified(w.addr, &w.bytes)))
     }
 
     /// Callers hold the lock.
@@ -331,5 +339,51 @@ mod tests {
         assert_eq!(describe_rate(Some(0x40)), "8000 Hz");
         assert_eq!(describe_rate(Some(0x03)), "unknown code 0x03");
         assert!(describe_rate(None).starts_with("invalid"));
+    }
+
+    /// A FIFO opened read-write answers every request with the request itself: `08 03` then says
+    /// "asleep" (byte 6 is 0), and flash reads echo correctly but return zeros. flock works on it.
+    fn loopback(tag: &str) -> std::path::PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("hecatectl-fifo-{tag}-{}-{nanos}", std::process::id()));
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        path
+    }
+
+    #[test]
+    fn require_online_inside_a_lock_checks_once() {
+        let path = loopback("once");
+        let mut m = Mouse::new(Device::open(&path).unwrap());
+        assert_eq!(m.online(), Ok(false));
+        let started = Instant::now();
+        let err = m.exclusive(|m| m.require_online()).unwrap_err();
+        assert!(err.contains("went to sleep"), "{err}");
+        // composite operations nested in an outer lock do not wait either
+        let err = m.exclusive(|m| m.read_image().map(|_| ())).unwrap_err();
+        assert!(err.contains("went to sleep"), "{err}");
+        let err = m.exclusive(|m| m.read_settings().map(|_| ())).unwrap_err();
+        assert!(err.contains("went to sleep"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_sleeping_mouse_does_not_hold_the_lock_while_waiting() {
+        let path = loopback("wait");
+        let mut a = Mouse::new(Device::open(&path).unwrap());
+        a.wake_wait = Duration::from_millis(700);
+        let waiting = std::thread::spawn(move || a.read_settings());
+        std::thread::sleep(Duration::from_millis(150));
+        // another process gets the lock while the first one waits for the mouse
+        let mut b = Device::open(&path).unwrap();
+        b.set_lock_wait(Duration::from_millis(80));
+        assert_eq!(b.lock(), Ok(()), "the wake-wait must not hold the lock");
+        b.unlock();
+        let err = waiting.join().unwrap().unwrap_err();
+        assert!(err.contains("stayed offline"), "{err}");
+        std::fs::remove_file(&path).unwrap();
     }
 }
