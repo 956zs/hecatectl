@@ -8,7 +8,7 @@ flash address 0xNN). Function citations are `FUN_14xxxxxxx` in HECATE.exe (decom
 
 Label sources: English = Qt source strings (the app has no English `.qm`); 中文 / ja / ko translations come from three
 `.qm` files embedded in HECATE.exe (file offsets 25271393 = `zh`, 25017536 = `ja_JP`, 25087497 = Korean although tagged
-`aa`); dump: `~/hecate-re/qm/{zh,aa}.tsv`, tool `/tmp/hecate-re-scripts/qmdump.py`. The device manual is
+`aa`); dump: `~/hecate-re/qm/{zh,aa}.tsv`, tool `~/hecate-re/scripts/qmdump.py`. The device manual is
 `data/deviceresource/g3mpro_upgrades/manual.pdf` (text in `~/hecate-re/manual/g3mpro_upgrades.txt`).
 
 "Write" column: **yes** = the handler calls `FUN_140118e60` → `JMMouseDeviceMessage::Write` → `SaveFlashData`
