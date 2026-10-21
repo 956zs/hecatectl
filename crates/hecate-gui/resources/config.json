@@ -1,0 +1,9 @@
+{
+  "device_poll_ms": 2000,
+  "theme_poll_ms": 2000,
+  "theme_colors_file": "quickshell/user/generated/colors.json",
+  "language": "auto",
+  "default_language": "zh_TW",
+  "font_family": "Google Sans Flex",
+  "icon_font_family": "Material Symbols Rounded"
+}

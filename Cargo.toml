@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/hecate-core", "crates/hecatectl"]
+members = ["crates/hecate-core", "crates/hecatectl", "crates/hecate-gui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,11 @@ license = "MIT"
 [workspace.dependencies]
 hecate-core = { path = "crates/hecate-core" }
 libc = "0.2"
+cxx = "1.0"
+cxx-qt = "0.10"
+cxx-qt-build = "0.10"
+cxx-qt-lib = "0.10"
+serde_json = "1"
 
 [profile.release]
 opt-level = "s"
