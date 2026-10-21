@@ -6,8 +6,6 @@ pub mod qobject {
     unsafe extern "C++" {
         include!("cxx-qt-lib/qstring.h");
         type QString = cxx_qt_lib::QString;
-        include!("cxx-qt-lib/qlist.h");
-        type QList_i32 = cxx_qt_lib::QList<i32>;
     }
 
     #[auto_cxx_name]
@@ -21,9 +19,14 @@ pub mod qobject {
         #[qproperty(i32, battery_percent, READ, NOTIFY)]
         #[qproperty(bool, charging, READ, NOTIFY)]
         #[qproperty(QString, firmware, READ, NOTIFY)]
-        #[qproperty(i32, report_rate, READ, NOTIFY)]
-        #[qproperty(QList_i32, report_rates, READ, CONSTANT)]
+        #[qproperty(QString, receiver_firmware, READ, NOTIFY)]
+        #[qproperty(i32, long_range, READ, NOTIFY)]
+        #[qproperty(bool, loaded, READ, NOTIFY)]
+        #[qproperty(QString, settings_json, READ, NOTIFY)]
+        #[qproperty(QString, options_json, READ, CONSTANT)]
         #[qproperty(bool, busy, READ, NOTIFY)]
+        #[qproperty(bool, pairing, READ, NOTIFY)]
+        #[qproperty(f64, pairing_progress, READ, NOTIFY)]
         #[qproperty(QString, last_error, READ, NOTIFY)]
         type Device = super::DeviceRust;
 
@@ -31,13 +34,35 @@ pub mod qobject {
         #[qinvokable]
         fn refresh(&self);
 
-        /// Writes the report rate in Hz, then reads the settings back.
+        /// Applies a settings patch (JSON object, see settings_map.rs), then reads the settings back.
         #[qinvokable]
-        fn set_report_rate(&self, hz: i32);
+        fn change(&self, patch: &QString);
+
+        /// Long-distance radio mode (`08 16`), read back afterwards.
+        #[qinvokable]
+        fn set_long_range(&self, on: bool);
+
+        /// Factory reset (`08 09`) followed by a full re-read; `resetFinished` on success.
+        #[qinvokable]
+        fn factory_reset(&self);
+
+        /// Receiver pairing (`08 05` + status polls); `pairingFinished` with the result.
+        #[qinvokable]
+        fn start_pairing(&self);
+
+        /// DPI at a slider position, for the label while dragging.
+        #[qinvokable]
+        fn dpi_at(&self, position: i32) -> i32;
 
         /// Emitted for every error, also when the message repeats.
         #[qsignal]
         fn error_occurred(self: Pin<&mut Self>, message: QString);
+
+        #[qsignal]
+        fn reset_finished(self: Pin<&mut Self>);
+
+        #[qsignal]
+        fn pairing_finished(self: Pin<&mut Self>, success: bool);
     }
 
     impl cxx_qt::Threading for Device {}
@@ -46,10 +71,14 @@ pub mod qobject {
 
 use super::update;
 use crate::config;
+use crate::display;
+use crate::dpi_slider;
+use crate::settings_map;
 use crate::worker::{self, Command, Event};
 use core::pin::Pin;
 use cxx_qt::{CxxQtType, Threading};
-use cxx_qt_lib::{QList, QString};
+use cxx_qt_lib::QString;
+use hecate_core::mouse::PAIRING_POLLS;
 use hecate_core::protocol;
 use std::sync::mpsc::{self, Sender};
 
@@ -61,20 +90,26 @@ pub struct DeviceRust {
     battery_percent: i32,
     charging: bool,
     firmware: QString,
-    /// 0 while unknown.
-    report_rate: i32,
-    report_rates: QList<i32>,
+    /// Empty unless the receiver row is shown (`display::receiver_version`).
+    receiver_firmware: QString,
+    /// -1 while unknown, else 0 or 1.
+    long_range: i32,
+    /// The first full settings read on this connection has finished.
+    loaded: bool,
+    /// `settings_map::to_json`, empty until loaded.
+    settings_json: QString,
+    options_json: QString,
     busy: bool,
+    pairing: bool,
+    /// 0..1 of the vendor's pairing poll budget.
+    pairing_progress: f64,
     last_error: QString,
     commands: Option<Sender<Command>>,
 }
 
 impl Default for DeviceRust {
     fn default() -> Self {
-        let mut report_rates = QList::default();
-        for (hz, _) in protocol::SETTABLE_RATES {
-            report_rates.append(hz as i32);
-        }
+        let options = settings_map::options(&config::get().product_url);
         Self {
             present: false,
             online: false,
@@ -82,9 +117,14 @@ impl Default for DeviceRust {
             battery_percent: -1,
             charging: false,
             firmware: QString::default(),
-            report_rate: 0,
-            report_rates,
+            receiver_firmware: QString::default(),
+            long_range: -1,
+            loaded: false,
+            settings_json: QString::default(),
+            options_json: QString::from(&options.to_string()),
             busy: false,
+            pairing: false,
+            pairing_progress: 0.0,
             last_error: QString::default(),
             commands: None,
         }
@@ -96,11 +136,25 @@ impl qobject::Device {
         self.send(Command::Refresh);
     }
 
-    pub fn set_report_rate(&self, hz: i32) {
-        match u32::try_from(hz) {
-            Ok(hz) => self.send(Command::SetReportRate(hz)),
-            Err(_) => eprintln!("hecate-gui: ignoring report rate {hz}"),
-        }
+    pub fn change(&self, patch: &QString) {
+        self.send(Command::Change(patch.to_string()));
+    }
+
+    pub fn set_long_range(&self, on: bool) {
+        self.send(Command::SetLongRange(on));
+    }
+
+    pub fn factory_reset(&self) {
+        self.send(Command::FactoryReset);
+    }
+
+    pub fn start_pairing(&self) {
+        self.send(Command::StartPairing);
+    }
+
+    pub fn dpi_at(&self, position: i32) -> i32 {
+        let dpi = dpi_slider::to_dpi(u32::try_from(position).unwrap_or(0));
+        i32::try_from(dpi).unwrap_or(i32::MAX)
     }
 
     fn send(&self, command: Command) {
@@ -117,14 +171,30 @@ fn apply(mut device: Pin<&mut qobject::Device>, event: Event) {
             update!(device, present, present_changed, s.present);
             update!(device, online, online_changed, s.online);
             update!(device, connection, connection_changed, QString::from(s.connection));
-            update!(device, battery_percent, battery_percent_changed, s.battery_percent.map_or(-1, i32::from));
+            let battery = s.battery_percent.map_or(-1, |l| i32::from(display::battery_percent(l)));
+            update!(device, battery_percent, battery_percent_changed, battery);
             update!(device, charging, charging_changed, s.charging);
-            let firmware = s.firmware.map(|v| format!("0x{v:04x}")).unwrap_or_default();
+            let firmware = s.firmware.map(protocol::format_version).unwrap_or_default();
             update!(device, firmware, firmware_changed, QString::from(&firmware));
-            let rate = s.report_rate.and_then(|hz| i32::try_from(hz).ok()).unwrap_or(0);
-            update!(device, report_rate, report_rate_changed, rate);
+            let receiver = display::receiver_version(s.connection, s.receiver_firmware, s.firmware);
+            let receiver = receiver.map(protocol::format_version).unwrap_or_default();
+            update!(device, receiver_firmware, receiver_firmware_changed, QString::from(&receiver));
+            update!(device, long_range, long_range_changed, s.long_range.map_or(-1, i32::from));
+            let json = s.settings.as_ref().map(|s| settings_map::to_json(s).to_string()).unwrap_or_default();
+            update!(device, settings_json, settings_json_changed, QString::from(&json));
+            update!(device, loaded, loaded_changed, s.settings.is_some());
         }
         Event::Busy(busy) => update!(device, busy, busy_changed, busy),
+        Event::ResetDone => device.as_mut().reset_finished(),
+        Event::PairingProgress(poll) => {
+            update!(device, pairing, pairing_changed, true);
+            update!(device, pairing_progress, pairing_progress_changed, f64::from(poll) / f64::from(PAIRING_POLLS));
+        }
+        Event::PairingFinished(success) => {
+            update!(device, pairing, pairing_changed, false);
+            update!(device, pairing_progress, pairing_progress_changed, 0.0);
+            device.as_mut().pairing_finished(success);
+        }
         Event::Error(message) => {
             let message = QString::from(&message);
             update!(device, last_error, last_error_changed, message.clone());
@@ -137,9 +207,10 @@ impl cxx_qt::Initialize for qobject::Device {
     fn initialize(mut self: Pin<&mut Self>) {
         let (tx, rx) = mpsc::channel();
         let qt = self.qt_thread();
-        let interval = config::get().device_poll;
+        let cfg = config::get();
+        let intervals = worker::Intervals { offline: cfg.device_poll_offline, online: cfg.device_poll_online };
         let spawned = std::thread::Builder::new().name("hecate-device".into()).spawn(move || {
-            worker::run(rx, interval, |event| qt.queue(move |device| apply(device, event)).is_ok());
+            worker::run(rx, intervals, |event| qt.queue(move |device| apply(device, event)).is_ok());
         });
         match spawned {
             Ok(_) => self.as_mut().rust_mut().commands = Some(tx),
