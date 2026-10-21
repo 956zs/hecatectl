@@ -1,12 +1,21 @@
 //! Mouse operations built on the transport, following the vendor library's sequences.
 
 use crate::hidraw::Device;
-use crate::protocol::{self as p, Battery};
+use crate::protocol::{self as p, Battery, PairingStatus};
 use crate::settings::{self, Settings};
+use crate::slots::{self, Macro, Shortcut, Slots, SLOTS};
 use std::time::{Duration, Instant};
 
 const WAKE_WAIT: Duration = Duration::from_secs(15);
 const WAKE_POLL: Duration = Duration::from_millis(300);
+/// ClearSetting: one try, 2000 ms (UsbMouse_ClearSetting @0x180012230 called by HECATE FUN_1400f9af0).
+const RESET_TIMEOUT: Duration = Duration::from_millis(2000);
+/// StartPair: 2 tries, 200 ms (FUN_180015f60). Not resent more often: it restarts pairing.
+const START_PAIR_TRIES: u32 = 2;
+const START_PAIR_TIMEOUT: Duration = Duration::from_millis(200);
+/// The vendor polls the pairing status every 200 ms and gives up after 100 polls (FUN_1400f87c0).
+pub const PAIRING_POLL_INTERVAL: Duration = Duration::from_millis(200);
+pub const PAIRING_POLLS: u32 = 100;
 
 pub struct Mouse {
     dev: Device,
@@ -129,6 +138,101 @@ impl Mouse {
         settings::verify(&writes, fresh.raw())?;
         Ok(fresh)
     }
+
+    /// `08 17`: long-distance radio mode (UsbMouse_GetLongRangeMode @0x1800128f0). Not a flash field.
+    /// The vendor queries it only while the mouse is online.
+    pub fn long_range(&mut self) -> Result<bool, String> {
+        let resp = self.dev.transact(&p::build(p::CMD_GET_LONG_RANGE, &[])?)?;
+        Ok(resp[p::DATA_OFFSET] != 0)
+    }
+
+    /// `08 16 .. 0A on`, applied immediately. Fails unless the reply echoes the requested mode
+    /// (UsbMouse_SetLongRangeMode @0x180012730).
+    pub fn set_long_range(&mut self, on: bool) -> Result<(), String> {
+        let resp = self.dev.transact(&p::set_long_range_request(on))?;
+        match resp[p::DATA_OFFSET] {
+            v if v == u8::from(on) => Ok(()),
+            v => Err(format!("long-range mode: the mouse answered {v} instead of {}", u8::from(on))),
+        }
+    }
+
+    /// `08 09` ClearSetting: factory reset of settings, keys and macros, sent once like the vendor.
+    /// Everything read before is stale afterwards.
+    pub fn factory_reset(&mut self) -> Result<(), String> {
+        self.dev.transact_with(&p::build(p::CMD_CLEAR_SETTING, &[])?, 1, RESET_TIMEOUT)?;
+        Ok(())
+    }
+
+    /// `08 05 .. 02` StartPair: puts the receiver into pairing mode. The vendor ignores the reply
+    /// (FUN_1400fc730) and goes straight to polling `pairing_status`.
+    pub fn start_pairing(&mut self) -> Result<(), String> {
+        self.dev.transact_with(&p::start_pair_request(), START_PAIR_TRIES, START_PAIR_TIMEOUT)?;
+        Ok(())
+    }
+
+    /// `08 06` GetPairingStatus (FUN_180016000). The vendor counts an unanswered poll as failed.
+    pub fn pairing_status(&mut self) -> Result<PairingStatus, String> {
+        let resp = self.dev.transact(&p::build(p::CMD_PAIRING_STATUS, &[])?)?;
+        Ok(p::parse_pairing_status(&resp))
+    }
+
+    /// All 16 shortcut and 16 macro slots, in the vendor's read order (FUN_180013a20): every size
+    /// probe first, then the bodies of the slots in use. Unused or corrupt slots are None.
+    pub fn read_slots(&mut self) -> Result<Slots, String> {
+        self.require_online()?;
+        let mut shortcut_len = [0; SLOTS];
+        for (i, len) in shortcut_len.iter_mut().enumerate() {
+            *len = slots::shortcut_len(self.read_flash(slots::shortcut_addr(i)?, 1)?[0]);
+        }
+        let mut macro_len = [0; SLOTS];
+        for (j, len) in macro_len.iter_mut().enumerate() {
+            *len = slots::macro_len(self.read_flash(slots::macro_addr(j)? + slots::MACRO_COUNT_OFFSET, 1)?[0]);
+        }
+        let mut out = Slots::default();
+        for (i, &len) in shortcut_len.iter().enumerate().filter(|(_, len)| **len > 0) {
+            out.shortcuts[i] = Shortcut::decode(&self.read_flash(slots::shortcut_addr(i)?, len)?);
+        }
+        for (j, &len) in macro_len.iter().enumerate().filter(|(_, len)| **len > 0) {
+            out.macros[j] = Macro::decode(&self.read_flash(slots::macro_addr(j)?, len)?);
+        }
+        Ok(out)
+    }
+
+    /// Writes shortcut slot `i` whole (FUN_180006e60 format), then reads it back and compares.
+    /// Keys[i] must have type 5 for the mouse to play it.
+    pub fn write_shortcut(&mut self, i: usize, s: &Shortcut) -> Result<(), String> {
+        let addr = slots::shortcut_addr(i)?;
+        let bytes = s.encode()?;
+        self.write_verified(addr, &bytes)
+    }
+
+    /// Writes macro slot `j` whole (FUN_180006a70 format), then reads it back and compares.
+    /// Keys[j] must be `(6, j, loop mode)` for the mouse to play it.
+    pub fn write_macro(&mut self, j: usize, m: &Macro) -> Result<(), String> {
+        let addr = slots::macro_addr(j)?;
+        let bytes = m.encode()?;
+        self.write_verified(addr, &bytes)
+    }
+
+    fn write_verified(&mut self, addr: u16, bytes: &[u8]) -> Result<(), String> {
+        self.require_online()?;
+        self.write_flash(addr, bytes)?;
+        let back = self.read_flash(addr, bytes.len())?;
+        compare_readback(addr, bytes, &back)
+    }
+}
+
+fn compare_readback(addr: u16, want: &[u8], got: &[u8]) -> Result<(), String> {
+    if got.len() != want.len() {
+        return Err(format!("read-back at 0x{addr:04x} returned {} bytes instead of {}", got.len(), want.len()));
+    }
+    match got.iter().zip(want).position(|(g, w)| g != w) {
+        None => Ok(()),
+        Some(k) => Err(format!(
+            "write at 0x{addr:04x} was acknowledged but byte {k} reads back as {:02x} instead of {:02x}",
+            got[k], want[k]
+        )),
+    }
 }
 
 pub fn describe_rate(code: Option<u8>) -> String {
@@ -138,5 +242,28 @@ pub fn describe_rate(code: Option<u8>) -> String {
             None => format!("unknown code 0x{c:02x}"),
         },
         None => "invalid (check byte mismatch, firmware uses its default)".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readback_comparison() {
+        assert_eq!(compare_readback(0x100, &[1, 2, 3], &[1, 2, 3]), Ok(()));
+        assert_eq!(compare_readback(0x100, &[], &[]), Ok(()));
+        let err = compare_readback(0x300, &[1, 2, 3], &[1, 9, 3]).unwrap_err();
+        assert!(err.contains("0x0300") && err.contains("byte 1") && err.contains("09 instead of 02"), "{err}");
+        assert!(compare_readback(0x300, &[1, 2, 3], &[1, 2, 4]).unwrap_err().contains("byte 2"));
+        assert!(compare_readback(0x300, &[1, 2, 3], &[1, 2]).unwrap_err().contains("2 bytes instead of 3"));
+    }
+
+    #[test]
+    fn describes_rates() {
+        assert_eq!(describe_rate(Some(0x01)), "1000 Hz");
+        assert_eq!(describe_rate(Some(0x40)), "8000 Hz");
+        assert_eq!(describe_rate(Some(0x03)), "unknown code 0x03");
+        assert!(describe_rate(None).starts_with("invalid"));
     }
 }

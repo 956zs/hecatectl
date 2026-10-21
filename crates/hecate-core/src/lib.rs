@@ -4,3 +4,4 @@ pub mod hidraw;
 pub mod mouse;
 pub mod protocol;
 pub mod settings;
+pub mod slots;
