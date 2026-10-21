@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 
 const WAKE_WAIT: Duration = Duration::from_secs(15);
 const WAKE_POLL: Duration = Duration::from_millis(300);
-/// ClearSetting: one try, 2000 ms (UsbMouse_ClearSetting @0x180012230 called by HECATE FUN_1400f9af0).
-const RESET_TIMEOUT: Duration = Duration::from_millis(2000);
+/// ClearSetting: one try. The vendor waits 2000 ms (UsbMouse_ClearSetting @0x180012230 via HECATE
+/// FUN_1400f9af0) and ignores the result; over 2.4G the mouse answered after 3667 ms (live 2026-10-21).
+const RESET_TIMEOUT: Duration = Duration::from_millis(8000);
 /// StartPair: 2 tries, 200 ms (FUN_180015f60). Not resent more often: it restarts pairing.
 const START_PAIR_TRIES: u32 = 2;
 const START_PAIR_TIMEOUT: Duration = Duration::from_millis(200);

@@ -472,6 +472,24 @@ Captured with `HECATECTL_DEBUG=1` and `cargo run --example probe`:
 - Keys[3]/[4] (back/forward) are type 5, with shortcut slots 3/4 holding consumer Volume Down / Volume Up (0xEA / 0xE9).
   Macro slots 3/4 hold leftover Ctrl+Win+Left/Right macros with recorded delays (64/144/71 ms).
 
+### Live write tests (2026-10-21, owner present, backup taken first)
+
+- `08 16 … 0a 01` / `… 0a 00`: long-distance on and off, with an echo in `[6]`. `08 17` reads the state back.
+- Shortcut slot 3 rewritten with its own bytes `08 07 00 01 60 08 02 82 ea 00 42 ea 00 bb`: echoed, and it read back
+  identical.
+- `08 09` ClearSetting:
+  - The **reply takes ~3.7 s** over 2.4G. With the vendor's 2000 ms timeout, the first attempt looked unanswered and
+    changed nothing.
+  - For about a minute afterwards, flash reads may go unanswered even when `08 03` says online.
+  - A successful reset changed only: DPI stage 3 (0x14, to 1900 DPI), keyDebounceTime 0xA9, sensorSleepTime 0xB7,
+    power mode 0xB9 (to LP), and Keys[3]/[4] (0x6C/0x70, from combo back to the defaults).
+  - It did **not** clear shortcut or macro slots, and it kept the other DPI stages and colours. The firmware's
+    "factory" values are therefore not the vendor JSON defaults.
+- `hecatectl restore` then planned exactly those 6 groups, wrote them with read-back, and the full re-read matched
+  the backup.
+- Report rate measured after these tests (evdev, owner moving the mouse): median interval 1.01 ms (was 8.00 ms at
+  125 Hz).
+
 ## 10. UNCONFIRMED summary
 
 1. Whether the device echoes `[2..5]` (address/length) in replies to `08`/`07`.
