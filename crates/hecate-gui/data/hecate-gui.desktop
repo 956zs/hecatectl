@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=HECATE G3M PRO
+Name[zh_TW]=HECATE G3M PRO 升級版
+GenericName=Mouse Settings
+GenericName[zh_TW]=滑鼠設定
+Comment=Configure the HECATE G3M PRO (updated) wireless mouse
+Comment[zh_TW]=設定 HECATE G3M PRO 升級版無線滑鼠
+Exec=hecate-gui
+Icon=input-mouse
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=mouse;polling;report rate;HECATE;
+StartupWMClass=hecate-gui
