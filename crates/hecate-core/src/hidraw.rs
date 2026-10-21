@@ -14,9 +14,11 @@ pub const PRODUCT_IDS: [(u16, &str); 2] = [(0xd3fb, "2.4G receiver"), (0xd3fc, "
 /// Vendor usage page that carries the 0x08 config report.
 const CONFIG_USAGE_PAGE: u16 = 0xff02;
 
-/// Same retry policy as the vendor library: 2 tries, 200 ms each.
-const TRIES: u32 = 2;
-const TIMEOUT: Duration = Duration::from_millis(200);
+/// The vendor library uses 2 tries x 200 ms but retries whole operations at a higher level.
+/// Over 2.4G, replies are occasionally late or lost while the mouse drifts in and out of sleep
+/// (seen live 2026-10-21), so retry more. Reads and writes are idempotent, so resending is safe.
+const TRIES: u32 = 4;
+const TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
@@ -117,13 +119,18 @@ impl Device {
 
     /// Sends `req` and waits for the matching response, like the vendor library does.
     pub fn transact(&mut self, req: &Packet) -> Result<Packet, String> {
-        for _ in 0..TRIES {
+        self.transact_with(req, TRIES, TIMEOUT)
+    }
+
+    /// `transact` with an explicit retry count and per-try timeout.
+    pub fn transact_with(&mut self, req: &Packet, tries: u32, timeout: Duration) -> Result<Packet, String> {
+        for _ in 0..tries {
             self.drain();
             if self.debug {
                 eprintln!("tx {}", hex(req));
             }
             self.file.write_all(req).map_err(|e| format!("write: {e}"))?;
-            if let Some(resp) = self.wait_for(req)? {
+            if let Some(resp) = self.wait_for(req, timeout)? {
                 if self.debug {
                     eprintln!("rx {}", hex(&resp));
                 }
@@ -133,8 +140,8 @@ impl Device {
         Err(format!("no response to command 0x{:02x} (is the mouse awake and paired?)", req[1]))
     }
 
-    fn wait_for(&mut self, req: &Packet) -> Result<Option<Packet>, String> {
-        let deadline = Instant::now() + TIMEOUT;
+    fn wait_for(&mut self, req: &Packet, timeout: Duration) -> Result<Option<Packet>, String> {
+        let deadline = Instant::now() + timeout;
         let mut buf = [0u8; 64];
         loop {
             let left = deadline.saturating_duration_since(Instant::now());

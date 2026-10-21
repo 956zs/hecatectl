@@ -440,6 +440,26 @@ From the UI encoder: DPI → slider position (FUN_140236030), slider → registe
 
 ---
 
+## 10a. Live observations (2026-10-21, 2.4G receiver 35BB:D3FB, firmware 0x0313)
+
+Captured with `HECATECTL_DEBUG=1` and `cargo run --example probe`:
+
+- Flash reads answer in ~20 ms without `01` or `02` first, so neither a handshake nor SetActivedStatus is needed.
+- Replies echo `[2..5]`: `08 08 00 01 00 0a <10 data bytes>` for a read at 0x100, and `08 07 00 00 00 02 01 54 …`
+  echoes the write.
+- `08 03`:
+  - `[5]=01`, `[6]` = 01 awake / 00 asleep, `[7..9]` = `d5 9e 53` (constant, meaning unknown).
+  - The mouse also sends an unsolicited `08 03 01 00 …` now and then.
+- `08 12` → `08 12 00 00 00 02 03 13` = version 0x0313 (`[5]` = length 2).
+- `08 04` → `08 04 00 00 00 02 5a 00 0f d9` = 90 %, not charging, 4057 mV. Usually ~4 ms. Once it arrived more than
+  1 s late, during the next transaction. The transport now retries 4 × 250 ms.
+- `08 01` with random `7f ae 99 11` → `08 01 00 00 00 08 5a f9 dc c3 2d 04 00 00`. `[6..9]` looks like a
+  transformed challenge; `[10]`=0x2d (45 = JSON `cid`?), `[11]`=0x04.
+- Report rate: flash was `08 4d` (125 Hz). Writing `08 07 00 00 00 02 01 54 … ef` was acknowledged and read back as
+  `01 54` (1000 Hz).
+- Keys[8] = `[7 0 0]`. This is probably the hardware report-rate button, which would explain how the mouse ended up at
+  125 Hz.
+
 ## 10. UNCONFIRMED summary
 
 1. Whether the device echoes `[2..5]` (address/length) in replies to `08`/`07`.
