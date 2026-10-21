@@ -121,6 +121,10 @@ Goal: Linux CLI to configure the HECATE G3M PRO 升級版 (updated) mouse, first
   polls compare flash 0x000..0x00A and re-read on change; R4 failed write/reset/read → loading state until a read
   succeeds; R7 names decoded in `macro_name_encoding` first; R8 every exclusive() follows a fresh online check.
   Desktop Exec forces `QT_QPA_PLATFORM=wayland;xcb`; original icon data/hecate-gui.svg. 110 gui tests.
+- ✅ gui-skeleton: in-app language switch (Built-in Settings → 語言: 自動/繁體中文/English), live: Rust singleton
+  `StringTable` + QML wrapper `I18n` whose text() reads `StringTable.language`, so every binding re-evaluates.
+  Saved via `config::save_language` (only "language" changed, other keys/order kept, temp file + rename; missing
+  file created, invalid JSON refused and left unchanged, error in the snackbar). 115 gui tests.
 - ✅ Live write tests (owner present, 2026-10-21): long-distance on/off, slot 3 rewrite, factory reset (reply after
   3.7 s; reset touches 6 groups only) + restore from backup (6 writes verified), receiver pairing (status 3). Report
   rate measured 1.01 ms median = 1000 Hz.
