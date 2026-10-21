@@ -1,11 +1,14 @@
-[package]
-name = "hecatectl"
+[workspace]
+resolver = "2"
+members = ["crates/hecate-core", "crates/hecatectl"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "Configure HECATE G3M PRO (updated) mice on Linux over hidraw"
 license = "MIT"
 
-[dependencies]
+[workspace.dependencies]
+hecate-core = { path = "crates/hecate-core" }
 libc = "0.2"
 
 [profile.release]

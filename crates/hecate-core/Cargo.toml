@@ -1,0 +1,9 @@
+[package]
+name = "hecate-core"
+description = "Protocol, hidraw transport and settings model for HECATE G3M PRO (updated) mice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true

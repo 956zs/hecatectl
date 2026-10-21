@@ -1,8 +1,5 @@
-mod hidraw;
-mod mouse;
-mod protocol;
-
-use mouse::Mouse;
+use hecate_core::mouse::{self, Mouse};
+use hecate_core::{hidraw, protocol};
 use std::path::PathBuf;
 use std::process::ExitCode;
 

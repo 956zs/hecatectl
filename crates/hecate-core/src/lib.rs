@@ -1,0 +1,5 @@
+//! Protocol, transport and device operations for the HECATE G3M PRO (updated) mouse.
+
+pub mod hidraw;
+pub mod mouse;
+pub mod protocol;

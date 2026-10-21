@@ -3,10 +3,17 @@
 version = 4
 
 [[package]]
-name = "hecatectl"
+name = "hecate-core"
 version = "0.1.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "hecatectl"
+version = "0.1.0"
+dependencies = [
+ "hecate-core",
 ]
 
 [[package]]

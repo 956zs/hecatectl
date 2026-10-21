@@ -1,0 +1,9 @@
+[package]
+name = "hecatectl"
+description = "Configure HECATE G3M PRO (updated) mice on Linux over hidraw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hecate-core.workspace = true
