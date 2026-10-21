@@ -8,11 +8,13 @@ Rectangle {
     id: bar
 
     property string message
+    property string icon: "error"
     property bool shown: false
     property int timeout: 6000
 
-    function show(text) {
+    function show(text, iconName) {
         message = text
+        icon = iconName ?? "error"
         shown = true
         hideTimer.restart()
     }
@@ -42,7 +44,7 @@ Rectangle {
         spacing: 12
 
         Icon {
-            name: "error"
+            name: bar.icon
             size: 20
             color: Theme.inversePrimary
         }

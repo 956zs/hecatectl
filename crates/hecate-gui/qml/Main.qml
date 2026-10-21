@@ -20,6 +20,7 @@ ApplicationWindow {
     // Set from the command line by main.rs.
     property int startPage: 0
     property string screenshotPath
+    property bool importDeviceMacros: false
 
     Material.theme: Theme.dark ? Material.Dark : Material.Light
     Material.accent: Theme.primary
@@ -44,7 +45,9 @@ ApplicationWindow {
                 Layout.fillHeight: true
                 currentIndex: window.startPage
                 model: [
+                    { label: "nav.keyset", icon: "left_click" },
                     { label: "nav.performance", icon: "speed" },
+                    { label: "nav.macro", icon: "keyboard_command_key" },
                     { label: "nav.builtin", icon: "settings" }
                 ]
             }
@@ -73,7 +76,9 @@ ApplicationWindow {
                         Layout.fillHeight: true
                         currentIndex: rail.currentIndex
 
+                        KeySetPage {}
                         PerformancePage {}
+                        MacroPage {}
                         BuiltinSettingsPage {}
                     }
                 }
@@ -114,6 +119,32 @@ ApplicationWindow {
         target: Device
         function onErrorOccurred(message) {
             snackbar.show(I18n.text("error.message").arg(message))
+        }
+    }
+
+    // --import-device-macros: the "Import from device" button, run once after the first read.
+    Connections {
+        target: Device
+        enabled: window.importDeviceMacros
+        function onDeviceMacrosJsonChanged() {
+            if (Device.deviceMacrosJson.length === 0)
+                return
+            window.importDeviceMacros = false
+            Model.notify(I18n.text("macro.imported").arg(Macros.importDevice(Device.deviceMacrosJson)))
+        }
+    }
+
+    Connections {
+        target: Macros
+        function onFailed(problem) {
+            snackbar.show(Model.problemText(problem))
+        }
+    }
+
+    Connections {
+        target: Model
+        function onNotify(text) {
+            snackbar.show(text, "info")
         }
     }
 }

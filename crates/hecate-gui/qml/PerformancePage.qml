@@ -166,10 +166,11 @@ ScrollView {
                         Layout.preferredWidth: 1
                         stage: modelData
                         current: index === page.s.currentDpiStage
-                        onSelected: Model.change({ currentDpiStage: index })
-                        onDpiEntered: dpi => Model.change({ stageDpi: { stage: index, dpi: dpi } })
+                        onSelected: Model.change({ currentDpiStage: { stage: index, expect: Model.expectOf(modelData) } })
+                        onDpiEntered: dpi => Model.change({ stageDpi: { stage: index, dpi: dpi, expect: Model.expectOf(modelData) } })
                         onColorClicked: {
                             colorDialog.stage = index
+                            colorDialog.expect = Model.expectOf(modelData)
                             colorDialog.selectedColor = modelData.color
                             colorDialog.open()
                         }
@@ -211,6 +212,9 @@ ScrollView {
                     id: slider
 
                     readonly property int stagePosition: Model.currentStage?.position ?? 0
+                    // The stage as it was when the drag started; the patch expects it unchanged.
+                    property int dragStage: -1
+                    property var dragExpect: null
 
                     Layout.fillWidth: true
                     from: 0
@@ -222,12 +226,15 @@ ScrollView {
                     Material.accent: Theme.primary
 
                     onPressedChanged: {
-                        if (pressed)
+                        if (pressed) {
+                            dragStage = page.s.currentDpiStage
+                            dragExpect = Model.currentStage ? Model.expectOf(Model.currentStage) : null
                             return
+                        }
                         const position = Math.round(value)
                         value = Qt.binding(() => stagePosition)
-                        if (position !== stagePosition)
-                            Model.change({ stagePosition: { stage: page.s.currentDpiStage, position: position } })
+                        if (position !== stagePosition && dragExpect)
+                            Model.change({ stagePosition: { stage: dragStage, position: position, expect: dragExpect } })
                     }
                 }
 
@@ -283,8 +290,9 @@ ScrollView {
         id: colorDialog
 
         property int stage: 0
+        property var expect: null
 
         title: I18n.text("dpi.color_title")
-        onAccepted: Model.change({ stageColor: { stage: stage, color: selectedColor.toString() } })
+        onAccepted: Model.change({ stageColor: { stage: stage, color: selectedColor.toString(), expect: expect } })
     }
 }
