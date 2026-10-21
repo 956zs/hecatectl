@@ -432,7 +432,7 @@ From the UI encoder: DPI → slider position (FUN_140236030), slider → registe
 
 ### 9.3 Macro slot (0x300 + 0x180*j, length 5n+0x21) — FUN_180002ba0 / FUN_180002ac0
 
-- `[0]` = name length (1..0x1E). `[1..0x1E]` = name bytes.
+- `[0]` = name length (1..0x1E). `[1..0x1E]` = name bytes in the writing PC's ANSI code page (live: Big5), padded with 0xFF (FUN_180006a70).
 - `[0x1F]` = n, the number of events (2..0x46).
 - n × 5 bytes from 0x20: `[s, v0, v1, delay_hi, delay_lo]`. `s` is encoded as in §9.2. `delay` is a big-endian
   u16 (unit ms? **UNCONFIRMED**).
@@ -459,6 +459,9 @@ Captured with `HECATECTL_DEBUG=1` and `cargo run --example probe`:
   `01 54` (1000 Hz).
 - Keys[8] = `[7 0 0]`. This is probably the hardware report-rate button, which would explain how the mouse ended up at
   125 Hz.
+- Receiver bcdDevice 0x0102 (v1.02). Long-range mode reads off (`08 17 00 00 00 0a 00`).
+- Keys[3]/[4] (back/forward) are type 5, with shortcut slots 3/4 holding consumer Volume Down / Volume Up (0xEA / 0xE9).
+  Macro slots 3/4 hold leftover Ctrl+Win+Left/Right macros with recorded delays (64/144/71 ms).
 
 ## 10. UNCONFIRMED summary
 

@@ -189,7 +189,7 @@ load mapping at r_keyled_macro.c:21003):
   `delete`, `remove all` 清空.
 - Name: `Macro Name` 宏名; allowed `^[a-zA-Z0-9一-龥\s_-]+$` (FUN_140214ae0) with error `Input contains special
   characters!...`; input box limited by `LengthValidator(20)` (FUN_140302bb0; length measure **UNCONFIRMED**); flash name
-  field max 30 bytes (protocol.md §9.3); byte encoding of the name **UNCONFIRMED**.
+  field max 30 bytes (protocol.md §9.3); byte encoding of the name: the Windows ANSI code page of the PC that wrote it (live: Big5/CP950 names "切回去:D", "切螢幕:D"; GBK fails), so keep names as raw bytes and decode by trying UTF-8, then Big5.
 - `Delay option` 延时选择: `Automatic insertion delay` 自动插入延时 (record real gaps) or `Default delay` 默认延时 with edit
   default `50` and unit label `ms` → **macro delay unit = ms** (stored u16 BE, so ≤ 65535; UI range limit **UNCONFIRMED**).
 - `Insert event` 插入事件 combo: `Left Key`, `Right Key`, `Wheel Key`, `Back Key`, `Forward Key` (type 4, mask 1/2/4/8/16,
