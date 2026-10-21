@@ -47,22 +47,53 @@ Goal: Linux CLI to configure the HECATE G3M PRO 升級版 (updated) mouse, first
   DPI decoder = vendor FUN_140235080 (ex bits 6..7 + flags 0x03), not the inferred one in protocol.md §9.1.
   Their live read failure was transient (mouse near sleep): lead re-tested, reads answer in ~20 ms with no
   handshake; transport now retries 4×250 ms (commit d6f7dcf).
-- 🔄 gui-skeleton agent: crates/hecate-gui (cxx-qt, Theme, i18n, device worker, Performance rate + Device pages)
+- ✅ core-settings agent, phase 3 part C (committed): slots.rs (Shortcut/Macro codecs = FUN_180006e60 /
+  FUN_180002ac0 bytes), Mouse::read_slots/write_shortcut/write_macro, long_range/set_long_range, factory_reset,
+  start_pairing/pairing_status, protocol::format_version, DeviceInfo.receiver_version; CLI `slots`, `longrange`,
+  `reset --yes`, `pair --yes`, versions in `info`/`list`. Live read-only: firmware v3.19, receiver v1.02, long range
+  off; shortcut slots 3/4 = Volume Down/Up (Keys[3]/[4] type 5); macro slots 3/4 are stale leftovers (Ctrl+Win+←/→)
+  whose names are **Big5** bytes ("切回去:D", "切螢幕:D") → vendor writes names in the PC's ANSI code page.
+  Nothing written to the mouse (no 05/07/09/16 sent).
+- ✅ core-settings agent, backup/restore (committed): backup.rs (raw image 0x0000–0x1AFF + metadata, hand-written
+  JSON with 16-byte hex lines, strict parse; pure `plan_restore` = settings::diff on groups valid in the backup +
+  whole-slot writes / vendor disabled forms; `check_writes` guards vendor shapes), Mouse::read_image/restore, CLI
+  `backup <file>`, `restore <file> [--dry-run]`. **Owner backup: ~/hecate-re/backup-2026-10-21.json** (1000 Hz,
+  stages 500/950/1550/3800/7550/14100, HP, sensor sleep 15 min, volume keys); live dry-run vs. it = 0 writes.
+  Unmodelled but valid groups seen live at 0x54 (3+c), 0x58, 0x5A, 0x5C, 0x5E, 0xBB: reported, never written.
 - ✅ RE agent: docs/ui-features.md (vendor UI feature matrix for g3mpro_upgrades). Key: 4 tabs (KeySet, Performance
   Settings, Macro Management, Built-in Settings), no lighting page (only DPI stage colours); rates 125–1000 only; 5
   remappable keys = Keys[0..4]; units: sensorSleepTime/allLedOffTime = 10 s, LOD 1/2 = 1MM/2MM, macro delay = ms;
   DPI decoder found (FUN_140235080), slider 0..499, max 6 stages; reset has no confirm dialog.
 - ✅ GUI skeleton (crates/hecate-gui, cxx-qt 0.10, Cargo-only build): QML singletons `Device` (worker thread owns the
-  Mouse; mpsc commands in, `qt_thread().queue` events out; 2 s poll via find_devices + online()), `Theme` (ii matugen
+  Mouse; mpsc commands in, `qt_thread().queue` events out; vendor re-probe 1 s offline / 5 s online via
+  find_devices + online()), `Theme` (ii matugen
   colors.json, mtime poll, fallback resources/theme-fallback.json; matugen `on_*` roles are `*Content` in QML),
   `I18n` (i18n/zh_TW.json + en.json; LC_ALL > LC_MESSAGES > LANG, default zh_TW; `language` override in config).
   Tunables in resources/config.json, user override $XDG_CONFIG_HOME/hecate-gui/config.json. Pages: Performance (rate
-  segmented buttons), Device (status/connection/battery/firmware + refresh). 32 tests; build + clippy clean.
+  segmented buttons) and Built-in Settings (Device Info: status/connection/battery/firmware + refresh), named after
+  the vendor tabs; vendor labels (zh-TW in Taiwan terminology: opencc s2twp, reviewed by hand), vendor battery (0 -> 5, cap
+  100) and firmware (`v3.19`) formats in src/display.rs. 36 tests; build + clippy clean.
   Screenshots without touching the desktop: `QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software hecate-gui
-  [--page N] --screenshot out.png`. Live read: fw 0x0313, battery 90%, rate code 01 = 1000 Hz (was 125 Hz at 18:58,
-  the GUI did not write it; asked the lead).
+  [--page N] --screenshot out.png`. Live read: fw 0x0313, battery 90%, rate code 01 = 1000 Hz (set by the lead with
+  `hecatectl rate 1000`).
+- ✅ GUI phase 3 task D (gui-skeleton agent): full Performance Settings + Built-in Settings pages. Worker keeps the
+  `Settings` from `Mouse::read_settings` (on connect/wake, with version + `long_range`); QML gets
+  `Device.settingsJson` (view) + `optionsJson`, sends JSON patches via `Device.change()` → src/settings_map.rs (parse,
+  vendor-style apply incl. the DPI-Quantity shift of FUN_140236ef0) → `Mouse::apply`; any failure → full re-read.
+  src/dpi_slider.rs = §7.2 slider (all 500 positions tested against a transcription of FUN_1402367d0 and `DpiValue`),
+  typed DPI snapped like FUN_140236030. Device actions: long range, factory reset (+ our confirm dialog, then
+  vendor "Hint" box), pairing (vendor confirm text, 200 ms × 100 polls, progress, result), receiver row
+  (`display::receiver_version`), Product Specification URL in config. Polls 1 s until connected+loaded, then 5 s;
+  "Please wait for the data to load completely..." until the first read. Poll errors shown only when they repeat.
+  Pairing uses core PAIRING_POLLS/PAIRING_POLL_INTERVAL (poll, then sleep; StartPair reply ignored like the vendor).
+  57 gui tests, workspace green, clippy clean. Found: concurrent flash reads from two processes cross replies (reported
+  to lead; needs address matching / flock in core).
 - ✅ Phase 0 hardware validation (lead, 2026-10-21): full 0x100 read + `hecatectl show` work; flash had rate 08 4d
   (125 Hz); `hecatectl rate 1000` wrote `08 07 00 00 00 02 01 54 … ef`, ack + read-back 01 54 = 1000 Hz.
+- 🔄 core-settings: cross-process safety (echo match on 07/08, operation-scoped flock, stale-snapshot check in apply)
+- 🔄 gui-skeleton: phase 4 KeySet + Macro Management pages
+- ⏳ Live write tests (owner approved all four 2026-10-21; waiting for owner at the mouse, after the safety fix):
+  longrange on/off, slot_rewrite 3, reset + restore from ~/hecate-re/backup-2026-10-21.json, pairing (L+wheel+R 3 s)
 - ⏳ Owner: measure with /tmp/mouse-diag/rate.py while moving the mouse (expect ~1.00 ms intervals).
 
 ## Rules
