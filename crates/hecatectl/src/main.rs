@@ -42,8 +42,8 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
     match args.as_slice() {
         ["list"] => cmd_list(),
         ["info"] => {
-            let node = resolve_node(device)?;
-            cmd_info(&mut open_node(&node)?, hidraw::receiver_version(&node))
+            let info = device_info(device)?;
+            cmd_info(&mut open_node(&info.node)?, info.receiver_version)
         }
         ["rate"] => cmd_rate_get(&mut open(device)?),
         ["rate", hz] => cmd_rate_set(&mut open(device)?, hz),
@@ -59,7 +59,7 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
         ["backup", file] => cmd_backup(device, Path::new(file)),
         ["restore", file] => cmd_restore(device, Path::new(file), false),
         ["restore", file, "--dry-run"] | ["restore", "--dry-run", file] => cmd_restore(device, Path::new(file), true),
-        ["pair", "--yes"] => cmd_pair(&mut open(device)?),
+        ["pair", "--yes"] => cmd_pair(&mut open_receiver(device)?),
         ["pair"] => Err("pairing puts the receiver into pairing mode and replaces its current link; \
                          run 'hecatectl pair --yes' to do it"
             .into()),
@@ -81,36 +81,66 @@ fn take_device_arg(args: &mut Vec<String>) -> Result<Option<PathBuf>, String> {
     Ok(Some(PathBuf::from(path)))
 }
 
-fn resolve_node(device: Option<PathBuf>) -> Result<PathBuf, String> {
-    if let Some(p) = device {
-        return Ok(p);
+/// The detected interface to use: the one named by `--device`, which must be one of them, or the only one.
+fn select_device(devs: Vec<DeviceInfo>, wanted: Option<&Path>) -> Result<DeviceInfo, String> {
+    if let Some(node) = wanted {
+        return devs.into_iter().find(|d| d.node == node).ok_or_else(|| {
+            format!("{} is not the config interface of a HECATE G3M PRO (updated); see 'hecatectl list'", node.display())
+        });
     }
-    let devs = hidraw::find_devices();
-    match devs.as_slice() {
-        [] => Err("no HECATE G3M PRO (updated) found".into()),
-        [one] => Ok(one.node.clone()),
-        many => {
-            let nodes: Vec<String> = many.iter().map(|d| format!("{} ({})", d.node.display(), d.kind)).collect();
+    match devs.len() {
+        0 => Err("no HECATE G3M PRO (updated) found".into()),
+        1 => Ok(devs.into_iter().next().expect("one device")),
+        _ => {
+            let nodes: Vec<String> = devs.iter().map(|d| format!("{} ({})", d.node.display(), d.kind)).collect();
             Err(format!("several mice found, pick one with --device: {}", nodes.join(", ")))
         }
     }
+}
+
+/// Like `select_device`, but only the 2.4G receiver: the vendor app pairs only through it (RepairDongle,
+/// docs/ui-features.md §6.2). Without `--device` the receiver is picked even when the cable is also connected.
+fn select_receiver(devs: Vec<DeviceInfo>, wanted: Option<&Path>) -> Result<DeviceInfo, String> {
+    let info = match wanted {
+        Some(_) => select_device(devs, wanted)?,
+        None => {
+            let receivers: Vec<DeviceInfo> = devs.into_iter().filter(DeviceInfo::is_receiver).collect();
+            if receivers.is_empty() {
+                return Err("no 2.4G receiver found; pairing goes through the receiver, like in the vendor app".into());
+            }
+            select_device(receivers, None)?
+        }
+    };
+    if !info.is_receiver() {
+        return Err(format!(
+            "{} is the {} connection; pairing goes through the 2.4G receiver, like in the vendor app",
+            info.node.display(),
+            info.kind
+        ));
+    }
+    Ok(info)
+}
+
+/// `--device` resolved through symlinks (such as a udev alias) to the /dev/hidrawN that find_devices reports.
+fn wanted_node(device: Option<PathBuf>) -> Option<PathBuf> {
+    device.map(|p| std::fs::canonicalize(&p).unwrap_or(p))
 }
 
 fn open_node(node: &Path) -> Result<Mouse, String> {
     Ok(Mouse::new(hidraw::Device::open(node)?))
 }
 
-/// The detected interface behind `--device` or the only one found, with its product id and versions.
+/// Every command goes through here, so `--device` must name a detected HECATE config interface.
 fn device_info(device: Option<PathBuf>) -> Result<DeviceInfo, String> {
-    let node = resolve_node(device)?;
-    hidraw::find_devices()
-        .into_iter()
-        .find(|d| d.node == node)
-        .ok_or_else(|| format!("{} is not the config interface of a HECATE G3M PRO (updated)", node.display()))
+    select_device(hidraw::find_devices(), wanted_node(device).as_deref())
 }
 
 fn open(device: Option<PathBuf>) -> Result<Mouse, String> {
-    open_node(&resolve_node(device)?)
+    open_node(&device_info(device)?.node)
+}
+
+fn open_receiver(device: Option<PathBuf>) -> Result<Mouse, String> {
+    open_node(&select_receiver(hidraw::find_devices(), wanted_node(device).as_deref())?.node)
 }
 
 fn cmd_list() -> Result<(), String> {
@@ -522,7 +552,11 @@ fn write_label(addr: u16) -> String {
 fn format_plan(plan: &RestorePlan) -> String {
     let mut out = String::new();
     if plan.writes.is_empty() {
-        out.push_str("no writes needed: the mouse matches the backup\n");
+        out.push_str(if plan.skipped.is_empty() {
+            "no writes needed: the mouse matches the backup\n"
+        } else {
+            "no writes planned\n"
+        });
     }
     for w in &plan.writes {
         for (k, row) in w.bytes.chunks(16).enumerate() {
@@ -537,6 +571,7 @@ fn format_plan(plan: &RestorePlan) -> String {
             let why = match s.reason {
                 SkipReason::InvalidInBackup => "check byte is wrong in the backup",
                 SkipReason::Unmodelled => "not a field the vendor app writes",
+                SkipReason::Refused => "a value the vendor app never writes for this mouse; refused",
             };
             writeln!(out, "0x{:04x}-0x{:04x}  {why}", s.range.start, s.range.end - 1).expect("write to String");
         }
@@ -752,6 +787,55 @@ mod tests {
              0x0006-0x0006  not a field the vendor app writes\n\
              0x00c1-0x00c2  check byte is wrong in the backup\n\
              2 writes planned\n"
+        );
+    }
+
+    fn dev(node: &str, product_id: u16, kind: &'static str) -> DeviceInfo {
+        DeviceInfo { node: PathBuf::from(node), product_id, kind, receiver_version: None }
+    }
+
+    /// ISSUES R5: `--device` must name a detected HECATE config interface, for every command.
+    #[test]
+    fn explicit_device_must_be_a_detected_node() {
+        let receiver = || dev("/dev/hidraw1", hidraw::RECEIVER_PID, "2.4G receiver");
+        let wired = || dev("/dev/hidraw4", hidraw::WIRED_PID, "wired");
+        let err = select_device(vec![receiver()], Some(Path::new("/dev/hidraw7"))).unwrap_err();
+        assert!(err.contains("/dev/hidraw7 is not the config interface"), "{err}");
+        assert!(select_device(vec![], Some(Path::new("/dev/hidraw1"))).is_err());
+        assert_eq!(select_device(vec![receiver(), wired()], Some(Path::new("/dev/hidraw4"))).unwrap().node, wired().node);
+        assert_eq!(select_device(vec![receiver()], None).unwrap().node, receiver().node);
+        assert!(select_device(vec![], None).unwrap_err().contains("no HECATE"));
+        assert!(select_device(vec![receiver(), wired()], None).unwrap_err().contains("several mice found"));
+        assert_eq!(wanted_node(None), None);
+        assert_eq!(wanted_node(Some(PathBuf::from("/nonexistent/x"))), Some(PathBuf::from("/nonexistent/x")));
+    }
+
+    /// ISSUES R5: StartPair (0x05) only goes to the 2.4G receiver, never over the cable.
+    #[test]
+    fn pair_requires_the_receiver() {
+        let receiver = || dev("/dev/hidraw1", hidraw::RECEIVER_PID, "2.4G receiver");
+        let wired = || dev("/dev/hidraw4", hidraw::WIRED_PID, "wired");
+        assert!(select_receiver(vec![wired()], None).unwrap_err().contains("no 2.4G receiver found"));
+        let err = select_receiver(vec![wired()], Some(Path::new("/dev/hidraw4"))).unwrap_err();
+        assert!(err.contains("wired connection"), "{err}");
+        assert_eq!(select_receiver(vec![wired(), receiver()], None).unwrap().node, receiver().node);
+        assert_eq!(select_receiver(vec![receiver()], Some(Path::new("/dev/hidraw1"))).unwrap().node, receiver().node);
+        assert!(select_receiver(vec![], None).is_err());
+        let two = vec![receiver(), dev("/dev/hidraw9", hidraw::RECEIVER_PID, "2.4G receiver")];
+        assert!(select_receiver(two, None).unwrap_err().contains("several mice found"));
+    }
+
+    #[test]
+    fn plan_listing_shows_refused_values() {
+        let plan = RestorePlan {
+            writes: vec![],
+            skipped: vec![backup::Skipped { range: 0x00..0x02, reason: SkipReason::Refused }],
+        };
+        assert_eq!(
+            format_plan(&plan),
+            "no writes planned\n\
+             not restorable, left as they are:\n\
+             0x0000-0x0001  a value the vendor app never writes for this mouse; refused\n"
         );
     }
 }

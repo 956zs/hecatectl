@@ -36,7 +36,7 @@ pub const POWER_LP: u8 = 0;
 pub const POWER_HP: u8 = 1;
 
 /// Flash addresses of the modelled groups (FUN_180005840 / FUN_1800063c0).
-mod addr {
+pub mod addr {
     pub const REPORT_RATE: usize = 0x00;
     pub const DPI_STAGE_COUNT: usize = 0x02;
     pub const CURRENT_DPI_STAGE: usize = 0x04;

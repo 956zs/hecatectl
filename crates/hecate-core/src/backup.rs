@@ -6,8 +6,8 @@
 //! `settings::diff`, whole slots via the slot codecs) and nothing outside those ranges.
 
 use crate::mouse::Mouse;
-use crate::protocol::CONFIG_BLOCK_LEN;
-use crate::settings::{self, Block, FlashWrite, Settings};
+use crate::protocol::{CONFIG_BLOCK_LEN, SETTABLE_RATES};
+use crate::settings::{self, addr, Block, FlashWrite, Settings, MAX_SELECTABLE_STAGES};
 use crate::slots::{self, Macro, Shortcut, Slots, SLOTS};
 use std::fmt::Write as _;
 use std::ops::Range;
@@ -175,6 +175,9 @@ pub enum SkipReason {
     InvalidInBackup,
     /// Not part of any group the vendor writes.
     Unmodelled,
+    /// A value the vendor app never writes for this mouse: a report-rate code it does not offer, a stage
+    /// count outside 1..=6, or an active stage not below the stage count.
+    Refused,
 }
 
 /// Settings bytes that differ from the backup but are left alone.
@@ -193,8 +196,10 @@ pub struct RestorePlan {
 
 /// Writes that turn the `current` flash image into `backup`, for a device with `product_id`.
 ///
-/// - Settings: `settings::diff`, keeping only groups whose check byte is valid in the backup. UI-choice
-///   validation is not applied: every value comes from a group the mouse itself stored.
+/// - Settings: `settings::diff`, keeping only groups whose check byte is valid in the backup. The UI-choice
+///   validation is not applied (a stored LOD 0 must restore), but values the vendor never writes for this
+///   mouse are refused and reported (`SkipReason::Refused`): hidden report-rate codes, a stage count
+///   outside 1..=6, an active stage not below the stage count.
 /// - Slots: a slot is written whole when its decoded content differs. A slot that is empty in the backup
 ///   gets the vendor's disabled form (`[00 FF]`, or the macro name with count 0).
 /// - Differing bytes outside the vendor's groups, and groups invalid in the backup, are reported in
@@ -217,11 +222,18 @@ pub fn plan_restore(product_id: u16, current: &[u8], backup: &Backup) -> Result<
         .filter(|w| groups.iter().any(|(r, valid)| *valid && r.start == usize::from(w.addr)))
         .collect();
 
+    let refused = refused_writes(&cur, &bkp, &writes);
+    writes.retain(|w| !refused.contains(&usize::from(w.addr)));
+
     let mut skipped: Vec<Skipped> = groups
         .iter()
         .filter(|(r, valid)| !valid && current[r.clone()] != target[r.clone()])
         .map(|(r, _)| Skipped { range: r.clone(), reason: SkipReason::InvalidInBackup })
         .collect();
+    skipped.extend(groups.iter().filter(|(r, _)| refused.contains(&r.start)).map(|(r, _)| Skipped {
+        range: r.clone(),
+        reason: SkipReason::Refused,
+    }));
     let modelled = |at: usize| groups.iter().any(|(r, _)| r.contains(&at));
     let unmodelled = (0..CONFIG_BLOCK_LEN).filter(|&at| !modelled(at) && current[at] != target[at]);
     skipped.extend(runs(unmodelled).into_iter().map(|range| Skipped { range, reason: SkipReason::Unmodelled }));
@@ -251,6 +263,33 @@ pub fn plan_restore(product_id: u16, current: &[u8], backup: &Backup) -> Result<
     }
     check_writes(&writes)?;
     Ok(RestorePlan { writes, skipped })
+}
+
+/// Settings writes a restore never sends, whatever the backup holds (protocol.md §2, §9): report-rate codes
+/// the vendor UI hides for this mouse, a stage count outside 1..=6, and an active stage that would not be
+/// below the stage count once the restore is done. Returns the group addresses to drop.
+fn refused_writes(cur: &Settings, bkp: &Settings, writes: &[FlashWrite]) -> Vec<usize> {
+    let planned = |at: usize| writes.iter().any(|w| usize::from(w.addr) == at);
+    let mut out = Vec::new();
+    if planned(addr::REPORT_RATE) && !SETTABLE_RATES.iter().any(|(_, c)| *c == bkp.report_rate.value) {
+        out.push(addr::REPORT_RATE);
+    }
+    let mut count_written = planned(addr::DPI_STAGE_COUNT);
+    if count_written && !(1..=MAX_SELECTABLE_STAGES).contains(&bkp.dpi_stage_count.value) {
+        out.push(addr::DPI_STAGE_COUNT);
+        count_written = false;
+    }
+    let count = if count_written { bkp.dpi_stage_count.value } else { cur.dpi_stage_count.value };
+    let mut current_written = planned(addr::CURRENT_DPI_STAGE);
+    if current_written && bkp.current_dpi_stage.value >= count {
+        out.push(addr::CURRENT_DPI_STAGE);
+        current_written = false;
+    }
+    let current = if current_written { bkp.current_dpi_stage.value } else { cur.current_dpi_stage.value };
+    if count_written && current >= count {
+        out.push(addr::DPI_STAGE_COUNT);
+    }
+    out
 }
 
 /// Consecutive addresses merged into ranges.
@@ -800,6 +839,65 @@ mod tests {
         for at in (0..IMAGE_LEN).filter(|at| !written.iter().any(|r| r.contains(at))) {
             assert_eq!(after[at], current[at], "0x{at:04x}");
         }
+    }
+
+    /// Ported from the review repro `restore_writes_a_hidden_rate_code` (ISSUES R6): an edited or foreign
+    /// backup with the hidden 8 kHz code, 8 stages and active stage 7.
+    #[test]
+    fn restore_refuses_values_the_vendor_never_writes() {
+        let current = owner_image();
+        let mut target = current.clone();
+        put(&mut target, 0x00, &[0x40]);
+        put(&mut target, 0x02, &[8]);
+        put(&mut target, 0x04, &[7]);
+        let plan = plan_restore(0xD3FB, &current, &backup_of(target)).unwrap();
+        assert!(!plan.writes.iter().any(|w| w.addr < 0x06), "{:?}", plan.writes);
+        assert!(!plan.writes.contains(&FlashWrite { addr: 0, bytes: vec![0x40, 0x15] }));
+        let refused: Vec<Range<usize>> =
+            plan.skipped.iter().filter(|s| s.reason == SkipReason::Refused).map(|s| s.range.clone()).collect();
+        assert_eq!(refused, [0x00..0x02, 0x02..0x04, 0x04..0x06]);
+        for code in [0x10, 0x20, 0x00, 0x03] {
+            let mut target = owner_image();
+            put(&mut target, 0x00, &[code]);
+            let plan = plan_restore(0xD3FB, &current, &backup_of(target)).unwrap();
+            assert!(plan.writes.is_empty(), "rate code 0x{code:02x}");
+            assert_eq!(plan.skipped[0].reason, SkipReason::Refused);
+        }
+        let mut target = owner_image();
+        put(&mut target, 0x02, &[0]);
+        assert_eq!(plan_restore(0xD3FB, &current, &backup_of(target)).unwrap().writes, vec![]);
+    }
+
+    #[test]
+    fn restore_keeps_stage_count_and_active_stage_consistent() {
+        let mut current = owner_image(); // 6 stages, active 2
+        put(&mut current, 0x04, &[4]);
+        // allowed values are written: 500 Hz, 3 stages, active stage 1
+        let mut target = owner_image();
+        put(&mut target, 0x00, &[0x02]);
+        put(&mut target, 0x02, &[3]);
+        put(&mut target, 0x04, &[1]);
+        let plan = plan_restore(0xD3FB, &current, &backup_of(target)).unwrap();
+        let addrs: Vec<u16> = plan.writes.iter().map(|w| w.addr).collect();
+        assert_eq!(addrs, [0x00, 0x02, 0x04]);
+        assert!(plan.skipped.is_empty());
+        // the active stage is invalid in the backup, so the device keeps stage 4: 2 stages would leave it out of range
+        let mut target = owner_image();
+        put(&mut target, 0x02, &[2]);
+        target[0x05] ^= 0x01;
+        let plan = plan_restore(0xD3FB, &current, &backup_of(target)).unwrap();
+        assert_eq!(plan.writes, vec![]);
+        let reasons: Vec<(usize, SkipReason)> = plan.skipped.iter().map(|s| (s.range.start, s.reason)).collect();
+        assert_eq!(reasons, [(0x02, SkipReason::Refused), (0x04, SkipReason::InvalidInBackup)]);
+        // an active stage beyond the device's stage count is refused when the count is not restored
+        let mut target = owner_image();
+        put(&mut target, 0x04, &[5]);
+        let mut small = owner_image();
+        put(&mut small, 0x02, &[3]);
+        put(&mut target, 0x02, &[3]);
+        target[0x03] ^= 0x01; // count invalid in the backup: the device keeps 3
+        let plan = plan_restore(0xD3FB, &small, &backup_of(target)).unwrap();
+        assert!(!plan.writes.iter().any(|w| w.addr == 0x04), "{:?}", plan.writes);
     }
 
     #[test]
