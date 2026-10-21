@@ -340,25 +340,28 @@ fn cmd_reset(m: &mut Mouse) -> Result<(), String> {
 /// the status every 200 ms: 3 succeeds, 0 or 2 or no answer fails, more than 100 retries fails.
 fn cmd_pair(m: &mut Mouse) -> Result<(), String> {
     const FAILED: &str = "Pairing failed, please make sure both the device and the dongle are properly connected.";
-    if let Err(e) = m.start_pairing() {
-        eprintln!("start pairing: {e} (polling anyway, like the vendor app)");
-    }
-    println!("pairing started: put the mouse into pairing mode...");
-    for poll in 0..=mouse::PAIRING_POLLS {
-        match m.pairing_status() {
-            Ok(PairingStatus::Paired) => {
-                println!("Pairing success!");
-                return Ok(());
+    // StartPair and the whole poll loop are one locked operation.
+    m.exclusive(|m| {
+        if let Err(e) = m.start_pairing() {
+            eprintln!("start pairing: {e} (polling anyway, like the vendor app)");
+        }
+        println!("pairing started: put the mouse into pairing mode...");
+        for poll in 0..=mouse::PAIRING_POLLS {
+            match m.pairing_status() {
+                Ok(PairingStatus::Paired) => {
+                    println!("Pairing success!");
+                    return Ok(());
+                }
+                Ok(PairingStatus::Failed) => return Err(FAILED.into()),
+                Err(e) => return Err(format!("{FAILED} ({e})")),
+                Ok(PairingStatus::InProgress(_)) => {}
             }
-            Ok(PairingStatus::Failed) => return Err(FAILED.into()),
-            Err(e) => return Err(format!("{FAILED} ({e})")),
-            Ok(PairingStatus::InProgress(_)) => {}
+            if poll < mouse::PAIRING_POLLS {
+                std::thread::sleep(mouse::PAIRING_POLL_INTERVAL);
+            }
         }
-        if poll < mouse::PAIRING_POLLS {
-            std::thread::sleep(mouse::PAIRING_POLL_INTERVAL);
-        }
-    }
-    Err(format!("{FAILED} (timed out)"))
+        Err(format!("{FAILED} (timed out)"))
+    })
 }
 
 fn cmd_slots(m: &mut Mouse) -> Result<(), String> {
@@ -453,32 +456,35 @@ fn cmd_restore(device: Option<PathBuf>, path: &Path, dry_run: bool) -> Result<()
     let info = device_info(device)?;
     let mut m = open_node(&info.node)?;
     m.require_online()?;
-    let firmware = m.version()?;
-    if firmware != b.firmware {
-        println!(
-            "warning: the mouse runs firmware {}, the backup was taken on {}",
-            protocol::format_version(firmware),
-            protocol::format_version(b.firmware)
-        );
-    }
-    eprintln!("reading the current flash (about 700 reads)...");
-    let plan = backup::plan_restore(info.product_id, &m.read_image()?, &b)?;
-    print!("{}", format_plan(&plan));
-    if dry_run {
-        println!("dry run: nothing was sent");
-        return Ok(());
-    }
-    if plan.writes.is_empty() {
-        return Ok(());
-    }
-    m.restore(&plan)?;
-    eprintln!("verifying: reading the flash again...");
-    let left = backup::plan_restore(info.product_id, &m.read_image()?, &b)?;
-    if !left.writes.is_empty() {
-        return Err(format!("{} writes still differ after the restore:\n{}", left.writes.len(), format_plan(&left)));
-    }
-    println!("restored: {} writes, each read back, and the mouse now matches the backup", plan.writes.len());
-    Ok(())
+    // From the read the plan is made of to the final verification, no other process gets in between.
+    m.exclusive(|m| {
+        let firmware = m.version()?;
+        if firmware != b.firmware {
+            println!(
+                "warning: the mouse runs firmware {}, the backup was taken on {}",
+                protocol::format_version(firmware),
+                protocol::format_version(b.firmware)
+            );
+        }
+        eprintln!("reading the current flash (about 700 reads)...");
+        let plan = backup::plan_restore(info.product_id, &m.read_image()?, &b)?;
+        print!("{}", format_plan(&plan));
+        if dry_run {
+            println!("dry run: nothing was sent");
+            return Ok(());
+        }
+        if plan.writes.is_empty() {
+            return Ok(());
+        }
+        m.restore(&plan)?;
+        eprintln!("verifying: reading the flash again...");
+        let left = backup::plan_restore(info.product_id, &m.read_image()?, &b)?;
+        if !left.writes.is_empty() {
+            return Err(format!("{} writes still differ after the restore:\n{}", left.writes.len(), format_plan(&left)));
+        }
+        println!("restored: {} writes, each read back, and the mouse now matches the backup", plan.writes.len());
+        Ok(())
+    })
 }
 
 fn backup_summary(b: &Backup) -> String {

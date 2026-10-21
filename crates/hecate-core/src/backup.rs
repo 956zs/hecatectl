@@ -44,11 +44,11 @@ impl Backup {
         Ok(Self { created_unix, product_id, firmware, receiver, image })
     }
 
-    /// Reads the whole image from the mouse (`Mouse::read_image`) and stamps it with the current time.
+    /// Reads the firmware version and the whole image (`Mouse::read_image`) in one locked operation and
+    /// stamps them with the current time.
     pub fn take(mouse: &mut Mouse, product_id: u16, receiver: Option<u16>) -> Result<Self, String> {
         mouse.require_online()?;
-        let firmware = mouse.version()?;
-        let image = mouse.read_image()?;
+        let (firmware, image) = mouse.exclusive(|m| Ok((m.version()?, m.read_image()?)))?;
         let created_unix = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         Self::new(created_unix, product_id, firmware, receiver, image)
     }

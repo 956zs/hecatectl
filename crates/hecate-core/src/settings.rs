@@ -376,6 +376,16 @@ pub fn group_ranges(s: &Settings) -> Vec<(std::ops::Range<usize>, bool)> {
     entries(s).into_iter().map(|e| (e.addr..e.addr + e.data.len() + 1, e.valid)).collect()
 }
 
+/// Group ranges whose stored bytes differ between a snapshot and a fresh read of the device. Empty means
+/// the snapshot still describes every group a diff could write. Unmodelled bytes are not compared.
+pub fn stale_groups(snapshot: &Settings, device: &Settings) -> Vec<std::ops::Range<usize>> {
+    group_ranges(snapshot)
+        .into_iter()
+        .map(|(r, _)| r)
+        .filter(|r| snapshot.raw[r.clone()] != device.raw[r.clone()])
+        .collect()
+}
+
 fn changed<T: PartialEq>(old: &Checked<T>, new: &Checked<T>) -> bool {
     old.value != new.value || (!old.valid && new.valid)
 }
@@ -840,6 +850,19 @@ mod tests {
         assert_eq!(groups[0], (0x00..0x02, true)); // vendor order starts with the rate
         assert!(!groups.iter().find(|(r, _)| r.start == 0xE1).unwrap().1); // fury mode is erased in the fixture
         assert!(group_ranges(&decode(&[0xFF; CONFIG_BLOCK_LEN])).iter().all(|(_, valid)| !valid));
+    }
+
+    #[test]
+    fn stale_groups_compare_only_modelled_bytes() {
+        let snapshot = decode(&vendor_block());
+        assert_eq!(stale_groups(&snapshot, &snapshot.clone()), Vec::<std::ops::Range<usize>>::new());
+        let mut block = vendor_block();
+        put(&mut block, 0x04, &[3]); // the DPI button changed the active stage
+        block[0x0F] ^= 0x01; // stage 0 check byte corrupted
+        block[0xBB] = 0x0A; // unmodelled byte: ignored
+        block[0x06] = 0x00; // UNCONFIRMED group: ignored
+        assert_eq!(stale_groups(&snapshot, &decode(&block)), [0x04..0x06, 0x0C..0x10]);
+        assert_eq!(stale_groups(&decode(&[0xFF; CONFIG_BLOCK_LEN]), &decode(&[0x00; CONFIG_BLOCK_LEN])).len(), 55);
     }
 
     #[test]

@@ -27,13 +27,24 @@ impl Mouse {
         Self { dev }
     }
 
+    /// Runs `f` with the device lock held, so the whole sequence is one operation for other processes
+    /// (`Device::lock`: they wait up to 10 s, then get "device busy"). Nests: every operation below locks
+    /// itself as well. Call `require_online` before, not inside: it may sleep while waiting for the mouse.
+    pub fn exclusive<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, String>) -> Result<T, String> {
+        self.dev.lock()?;
+        let result = f(self);
+        self.dev.unlock();
+        result
+    }
+
     /// `08 03`: whether the mouse is connected (through the receiver or the cable).
     pub fn online(&mut self) -> Result<bool, String> {
         let resp = self.dev.transact(&p::build(p::CMD_ONLINE, &[])?)?;
         Ok(resp[p::DATA_OFFSET] != 0)
     }
 
-    /// Waits up to WAKE_WAIT for a sleeping mouse to come online.
+    /// Waits up to WAKE_WAIT for a sleeping mouse to come online. Each poll locks on its own, so a
+    /// sleeping mouse does not block other processes.
     pub fn require_online(&mut self) -> Result<(), String> {
         if self.online()? {
             return Ok(());
@@ -64,26 +75,31 @@ impl Mouse {
 
     /// Reads `len` bytes at `addr`. Unlike the vendor loader, any failed chunk is an error.
     pub fn read_flash(&mut self, addr: u16, len: usize) -> Result<Vec<u8>, String> {
-        let mut out = Vec::with_capacity(len);
-        while out.len() < len {
-            let at = addr as usize + out.len();
-            let at = u16::try_from(at).map_err(|_| format!("read past address 0x{:x}", u16::MAX))?;
-            let resp = self
-                .dev
-                .transact(&p::flash_read_request(at))
-                .map_err(|e| format!("flash read at 0x{at:04x}: {e}"))?;
-            let take = p::FLASH_CHUNK.min(len - out.len());
-            out.extend_from_slice(&resp[p::DATA_OFFSET..p::DATA_OFFSET + take]);
-        }
-        Ok(out)
+        self.exclusive(|m| {
+            let mut out = Vec::with_capacity(len);
+            while out.len() < len {
+                let at = addr as usize + out.len();
+                let at = u16::try_from(at).map_err(|_| format!("read past address 0x{:x}", u16::MAX))?;
+                let resp = m
+                    .dev
+                    .transact(&p::flash_read_request(at))
+                    .map_err(|e| format!("flash read at 0x{at:04x}: {e}"))?;
+                let take = p::FLASH_CHUNK.min(len - out.len());
+                out.extend_from_slice(&resp[p::DATA_OFFSET..p::DATA_OFFSET + take]);
+            }
+            Ok(out)
+        })
     }
 
     pub fn write_flash(&mut self, addr: u16, data: &[u8]) -> Result<(), String> {
-        for req in p::flash_write_requests(addr, data)? {
-            let at = u16::from_be_bytes([req[3], req[4]]);
-            self.dev.transact(&req).map_err(|e| format!("flash write at 0x{at:04x}: {e}"))?;
-        }
-        Ok(())
+        let requests = p::flash_write_requests(addr, data)?;
+        self.exclusive(|m| {
+            for req in &requests {
+                let at = u16::from_be_bytes([req[3], req[4]]);
+                m.dev.transact(req).map_err(|e| format!("flash write at 0x{at:04x}: {e}"))?;
+            }
+            Ok(())
+        })
     }
 
     /// Raw report-rate code stored at 0x0000, or None when the stored check byte is invalid.
@@ -92,52 +108,73 @@ impl Mouse {
         Ok(p::unguard([raw[0], raw[1]]))
     }
 
-    /// Sets the report rate: online check, write `[code, 0x55-code]` at 0x0000, read back.
-    /// Returns false when the mouse already had that rate (nothing written).
+    /// Sets the report rate: online check, then in one locked operation read 0x0000, write
+    /// `[code, 0x55-code]` if it differs, read back. Returns false when the mouse already had that rate.
     pub fn set_report_rate(&mut self, hz: u32) -> Result<bool, String> {
         let code = p::rate_code(hz).ok_or_else(|| {
             let allowed: Vec<String> = p::SETTABLE_RATES.iter().map(|(r, _)| r.to_string()).collect();
             format!("unsupported rate {hz} Hz (allowed: {})", allowed.join(", "))
         })?;
         self.require_online()?;
-        if self.report_rate_code()? == Some(code) {
-            return Ok(false);
-        }
-        self.write_flash(p::ADDR_REPORT_RATE, &p::guarded(code))?;
-        match self.report_rate_code()? {
-            Some(c) if c == code => Ok(true),
-            other => Err(format!(
-                "write was acknowledged but read-back shows {} instead of {hz} Hz",
-                describe_rate(other)
-            )),
-        }
+        self.exclusive(|m| {
+            if m.report_rate_code()? == Some(code) {
+                return Ok(false);
+            }
+            m.write_flash(p::ADDR_REPORT_RATE, &p::guarded(code))?;
+            match m.report_rate_code()? {
+                Some(c) if c == code => Ok(true),
+                other => Err(format!(
+                    "write was acknowledged but read-back shows {} instead of {hz} Hz",
+                    describe_rate(other)
+                )),
+            }
+        })
     }
 
     /// Online check, then the whole settings block (flash 0x000-0x0FF), decoded.
     pub fn read_settings(&mut self) -> Result<Settings, String> {
         self.require_online()?;
+        self.read_block()
+    }
+
+    fn read_block(&mut self) -> Result<Settings, String> {
         let raw = self.read_flash(0, p::CONFIG_BLOCK_LEN)?;
         let block: settings::Block = raw.try_into().map_err(|_| "short settings read".to_string())?;
         Ok(settings::decode(&block))
     }
 
-    /// Writes the groups that differ between `old` (as read from the mouse) and `new`, the way the
-    /// vendor save path does (FUN_180006630), then re-reads and returns the fresh settings.
-    /// Fails when a written group does not read back as written. After any error the flash state is
-    /// unknown: re-read before the next apply.
+    /// Writes the groups that differ between `old` (the settings as read from the mouse, unmodified) and
+    /// `new`, the way the vendor save path does (FUN_180006630), then re-reads and returns the fresh
+    /// settings. In one locked operation it first re-reads the block and refuses when any group differs
+    /// from `old`, so nothing is written on top of a stale or misread snapshot. Fails when a written group
+    /// does not read back as written. After any error, re-read before the next apply.
     pub fn apply(&mut self, old: &Settings, new: &Settings) -> Result<Settings, String> {
+        if settings::decode(old.raw()) != *old {
+            return Err("apply: `old` must be the settings as read from the mouse, unmodified".into());
+        }
         settings::validate(old, new)?;
         let writes = settings::diff(old, new);
         if writes.is_empty() {
             return Ok(old.clone());
         }
         self.require_online()?;
-        for w in &writes {
-            self.write_flash(w.addr, &w.bytes)?;
-        }
-        let fresh = self.read_settings()?;
-        settings::verify(&writes, fresh.raw())?;
-        Ok(fresh)
+        self.exclusive(|m| {
+            let stale = settings::stale_groups(old, &m.read_block()?);
+            if !stale.is_empty() {
+                let at: Vec<String> = stale.iter().map(|r| format!("0x{:02x}", r.start)).collect();
+                return Err(format!(
+                    "the mouse's settings changed since they were read (groups at {}); \
+                     nothing was written, re-read and try again",
+                    at.join(", ")
+                ));
+            }
+            for w in &writes {
+                m.write_flash(w.addr, &w.bytes)?;
+            }
+            let fresh = m.read_block()?;
+            settings::verify(&writes, fresh.raw())?;
+            Ok(fresh)
+        })
     }
 
     /// `08 17`: long-distance radio mode (UsbMouse_GetLongRangeMode @0x1800128f0). Not a flash field.
@@ -165,7 +202,7 @@ impl Mouse {
     }
 
     /// `08 05 .. 02` StartPair: puts the receiver into pairing mode. The vendor ignores the reply
-    /// (FUN_1400fc730) and goes straight to polling `pairing_status`.
+    /// (FUN_1400fc730) and goes straight to polling `pairing_status`; run both inside `exclusive`.
     pub fn start_pairing(&mut self) -> Result<(), String> {
         self.dev.transact_with(&p::start_pair_request(), START_PAIR_TRIES, START_PAIR_TIMEOUT)?;
         Ok(())
@@ -181,64 +218,70 @@ impl Mouse {
     /// probe first, then the bodies of the slots in use. Unused or corrupt slots are None.
     pub fn read_slots(&mut self) -> Result<Slots, String> {
         self.require_online()?;
-        let mut shortcut_len = [0; SLOTS];
-        for (i, len) in shortcut_len.iter_mut().enumerate() {
-            *len = slots::shortcut_len(self.read_flash(slots::shortcut_addr(i)?, 1)?[0]);
-        }
-        let mut macro_len = [0; SLOTS];
-        for (j, len) in macro_len.iter_mut().enumerate() {
-            *len = slots::macro_len(self.read_flash(slots::macro_addr(j)? + slots::MACRO_COUNT_OFFSET, 1)?[0]);
-        }
-        let mut out = Slots::default();
-        for (i, &len) in shortcut_len.iter().enumerate().filter(|(_, len)| **len > 0) {
-            out.shortcuts[i] = Shortcut::decode(&self.read_flash(slots::shortcut_addr(i)?, len)?);
-        }
-        for (j, &len) in macro_len.iter().enumerate().filter(|(_, len)| **len > 0) {
-            out.macros[j] = Macro::decode(&self.read_flash(slots::macro_addr(j)?, len)?);
-        }
-        Ok(out)
+        self.exclusive(|m| {
+            let mut shortcut_len = [0; SLOTS];
+            for (i, len) in shortcut_len.iter_mut().enumerate() {
+                *len = slots::shortcut_len(m.read_flash(slots::shortcut_addr(i)?, 1)?[0]);
+            }
+            let mut macro_len = [0; SLOTS];
+            for (j, len) in macro_len.iter_mut().enumerate() {
+                *len = slots::macro_len(m.read_flash(slots::macro_addr(j)? + slots::MACRO_COUNT_OFFSET, 1)?[0]);
+            }
+            let mut out = Slots::default();
+            for (i, &len) in shortcut_len.iter().enumerate().filter(|(_, len)| **len > 0) {
+                out.shortcuts[i] = Shortcut::decode(&m.read_flash(slots::shortcut_addr(i)?, len)?);
+            }
+            for (j, &len) in macro_len.iter().enumerate().filter(|(_, len)| **len > 0) {
+                out.macros[j] = Macro::decode(&m.read_flash(slots::macro_addr(j)?, len)?);
+            }
+            Ok(out)
+        })
     }
 
-    /// Writes shortcut slot `i` whole (FUN_180006e60 format), then reads it back and compares.
-    /// Keys[i] must have type 5 for the mouse to play it.
+    /// Writes shortcut slot `i` whole (FUN_180006e60 format), then reads it back and compares, in one
+    /// locked operation. A whole-slot write does not depend on an earlier read, so there is no snapshot
+    /// to go stale. Keys[i] must have type 5 for the mouse to play it.
     pub fn write_shortcut(&mut self, i: usize, s: &Shortcut) -> Result<(), String> {
         let addr = slots::shortcut_addr(i)?;
         let bytes = s.encode()?;
-        self.write_verified(addr, &bytes)
+        self.require_online()?;
+        self.exclusive(|m| m.write_verified(addr, &bytes))
     }
 
-    /// Writes macro slot `j` whole (FUN_180006a70 format), then reads it back and compares.
-    /// Keys[j] must be `(6, j, loop mode)` for the mouse to play it.
+    /// Writes macro slot `j` whole (FUN_180006a70 format), then reads it back and compares, in one
+    /// locked operation. Keys[j] must be `(6, j, loop mode)` for the mouse to play it.
     pub fn write_macro(&mut self, j: usize, m: &Macro) -> Result<(), String> {
         let addr = slots::macro_addr(j)?;
         let bytes = m.encode()?;
-        self.write_verified(addr, &bytes)
+        self.require_online()?;
+        self.exclusive(|mouse| mouse.write_verified(addr, &bytes))
     }
 
     /// Raw flash 0x0000..0x1B00: the settings block, then the whole shortcut area, then the whole macro
     /// area, in the vendor's area order (FUN_180013a20) but including unused slot bytes.
     pub fn read_image(&mut self) -> Result<Vec<u8>, String> {
         self.require_online()?;
-        let areas = [(0, p::CONFIG_BLOCK_LEN), (0x100, 0x200), (0x300, slots::USED_FLASH_LEN - 0x300)];
-        let mut image = Vec::with_capacity(slots::USED_FLASH_LEN);
-        for (addr, len) in areas {
-            image.extend(self.read_flash(addr, len)?);
-        }
-        Ok(image)
+        self.exclusive(|m| {
+            let areas = [(0, p::CONFIG_BLOCK_LEN), (0x100, 0x200), (0x300, slots::USED_FLASH_LEN - 0x300)];
+            let mut image = Vec::with_capacity(slots::USED_FLASH_LEN);
+            for (addr, len) in areas {
+                image.extend(m.read_flash(addr, len)?);
+            }
+            Ok(image)
+        })
     }
 
     /// Sends a restore plan in order, reading back each write before the next. Every write is checked
-    /// against the vendor's group and slot shapes first, so nothing outside them is ever sent.
+    /// against the vendor's group and slot shapes first, so nothing outside them is ever sent. The plan
+    /// must come from a `read_image` inside the same `exclusive` section.
     pub fn restore(&mut self, plan: &RestorePlan) -> Result<(), String> {
         backup::check_writes(&plan.writes)?;
-        for w in &plan.writes {
-            self.write_verified(w.addr, &w.bytes)?;
-        }
-        Ok(())
+        self.require_online()?;
+        self.exclusive(|m| plan.writes.iter().try_for_each(|w| m.write_verified(w.addr, &w.bytes)))
     }
 
+    /// Callers hold the lock.
     fn write_verified(&mut self, addr: u16, bytes: &[u8]) -> Result<(), String> {
-        self.require_online()?;
         self.write_flash(addr, bytes)?;
         let back = self.read_flash(addr, bytes.len())?;
         compare_readback(addr, bytes, &back)
