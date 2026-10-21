@@ -3,13 +3,15 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import HecateGui
 
-// Shown while there is no mouse to talk to: nothing plugged in, or the mouse is asleep.
+// Shown while the pages cannot be used: no mouse, mouse asleep, or the first read still running.
 Rectangle {
     id: banner
 
-    readonly property bool asleep: Device.present && !Device.online
+    readonly property string mode: !Device.present ? "offline"
+                                  : !Device.online ? "asleep"
+                                  : !Device.loaded ? "loading" : ""
 
-    visible: !Device.present || !Device.online
+    visible: mode.length > 0
     implicitHeight: row.implicitHeight + 2 * 16
     radius: 20
     color: Theme.secondaryContainer
@@ -22,12 +24,12 @@ Rectangle {
         spacing: 16
 
         Icon {
-            name: banner.asleep ? "bedtime" : "usb_off"
+            name: banner.mode === "offline" ? "usb_off" : banner.mode === "asleep" ? "bedtime" : "hourglass_top"
             size: 28
             color: Theme.secondaryContainerContent
 
             SequentialAnimation on opacity {
-                running: banner.visible && banner.asleep
+                running: banner.visible && banner.mode !== "offline"
                 loops: Animation.Infinite
                 alwaysRunToEnd: true
                 NumberAnimation { to: 0.35; duration: 900; easing.type: Easing.InOutSine }
@@ -40,7 +42,11 @@ Rectangle {
             spacing: 2
 
             Label {
-                text: banner.asleep ? I18n.text("status.asleep") : I18n.text("status.no_device")
+                Layout.fillWidth: true
+                text: banner.mode === "offline" ? I18n.text("status.no_device")
+                    : banner.mode === "asleep" ? I18n.text("status.asleep")
+                    : I18n.text("status.loading")
+                wrapMode: Text.Wrap
                 font.pixelSize: 15
                 font.weight: Font.DemiBold
                 color: Theme.secondaryContainerContent
@@ -48,7 +54,9 @@ Rectangle {
 
             Label {
                 Layout.fillWidth: true
-                text: banner.asleep ? I18n.text("status.asleep_hint") : I18n.text("status.no_device_hint")
+                visible: text.length > 0
+                text: banner.mode === "offline" ? I18n.text("status.no_device_hint")
+                    : banner.mode === "asleep" ? I18n.text("status.asleep_hint") : ""
                 wrapMode: Text.Wrap
                 font.pixelSize: 13
                 color: Theme.secondaryContainerContent

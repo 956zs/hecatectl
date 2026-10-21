@@ -14,15 +14,22 @@ QtObject {
     readonly property string connectionIcon: Device.connection === "wired" ? "usb" : "sensors"
     readonly property string batteryText: Device.batteryPercent < 0 ? I18n.text("value.unknown")
                                         : I18n.text("battery.value").arg(Device.batteryPercent)
+    // Vendor icon steps (docs/ui-features.md §6.4): charging, 100, 80-99, 60-79, 20-59, 0-19.
     readonly property string batteryIcon: {
         const p = Device.batteryPercent
         if (Device.charging)
             return "battery_charging_full"
         if (p < 0)
             return "battery_unknown"
-        if (p >= 95)
+        if (p >= 100)
             return "battery_full"
-        return "battery_" + Math.min(6, Math.floor(p * 7 / 100)) + "_bar"
+        if (p >= 80)
+            return "battery_6_bar"
+        if (p >= 60)
+            return "battery_5_bar"
+        if (p >= 20)
+            return "battery_3_bar"
+        return "battery_1_bar"
     }
     readonly property string firmwareText: Device.firmware.length > 0 ? Device.firmware : I18n.text("value.unknown")
 }

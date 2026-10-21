@@ -7,10 +7,10 @@ import HecateGui
 ApplicationWindow {
     id: window
 
-    width: 980
-    height: 640
-    minimumWidth: 760
-    minimumHeight: 520
+    width: 1180
+    height: 800
+    minimumWidth: 800
+    minimumHeight: 560
     visible: true
     title: I18n.text("app.title")
     color: Theme.background
@@ -45,7 +45,7 @@ ApplicationWindow {
                 currentIndex: window.startPage
                 model: [
                     { label: "nav.performance", icon: "speed" },
-                    { label: "nav.device", icon: "mouse" }
+                    { label: "nav.builtin", icon: "settings" }
                 ]
             }
 
@@ -74,7 +74,7 @@ ApplicationWindow {
                         currentIndex: rail.currentIndex
 
                         PerformancePage {}
-                        DevicePage {}
+                        BuiltinSettingsPage {}
                     }
                 }
             }
@@ -88,14 +88,26 @@ ApplicationWindow {
         }
     }
 
+    // --screenshot: grab once the settings are loaded (plus a moment to settle), or after 20 s.
     Timer {
+        property int ticks: 0
+
         running: window.screenshotPath.length > 0
-        interval: 3000
-        onTriggered: surface.grabToImage(result => {
-            if (!result.saveToFile(window.screenshotPath))
-                console.warn("cannot save", window.screenshotPath)
-            Qt.quit()
-        })
+        interval: 500
+        repeat: true
+        onTriggered: {
+            ticks += 1
+            if (ticks < 4 || (!Device.loaded && ticks < 40))
+                return
+            stop()
+            if (!Device.loaded)
+                console.warn("screenshot taken before the settings were read")
+            surface.grabToImage(result => {
+                if (!result.saveToFile(window.screenshotPath))
+                    console.warn("cannot save", window.screenshotPath)
+                Qt.quit()
+            })
+        }
     }
 
     Connections {

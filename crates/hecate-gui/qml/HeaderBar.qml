@@ -74,7 +74,7 @@ RowLayout {
             Chip {
                 visible: Device.present && Device.batteryPercent >= 0
                 icon: Format.batteryIcon
-                text: Device.charging ? I18n.text("battery.charging_value").arg(Device.batteryPercent) : Format.batteryText
+                text: Format.batteryText
                 tint: Device.charging ? Theme.primary
                     : Device.batteryPercent <= 15 ? Theme.error : Theme.surfaceVariantContent
             }

@@ -10,7 +10,7 @@ Item {
     property var model: []
     property int currentIndex: 0
 
-    implicitWidth: 88
+    implicitWidth: 92
 
     ColumnLayout {
         anchors.top: parent.top
@@ -46,8 +46,8 @@ Item {
                 readonly property bool active: rail.currentIndex === index
 
                 Layout.alignment: Qt.AlignHCenter
-                implicitWidth: 80
-                implicitHeight: 60
+                implicitWidth: 84
+                implicitHeight: pill.height + 4 + label.implicitHeight + 8
 
                 Rectangle {
                     id: pill
@@ -71,10 +71,14 @@ Item {
                 }
 
                 Label {
+                    id: label
                     anchors.top: pill.bottom
                     anchors.topMargin: 4
-                    anchors.horizontalCenter: parent.horizontalCenter
+                    width: parent.width
                     text: I18n.text(entry.modelData.label)
+                    wrapMode: Text.Wrap
+                    horizontalAlignment: Text.AlignHCenter
+                    lineHeight: 0.9
                     font.pixelSize: 12
                     font.weight: entry.active ? Font.DemiBold : Font.Medium
                     color: entry.active ? Theme.surfaceContent : Theme.surfaceVariantContent
