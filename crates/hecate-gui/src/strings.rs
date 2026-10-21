@@ -125,15 +125,15 @@ mod tests {
 
     #[test]
     fn lookup_uses_selected_table() {
-        assert_eq!(Strings::new("en", "zh_TW").get("nav.device"), "Device");
-        assert_eq!(Strings::new("zh_TW", "zh_TW").get("nav.device"), "裝置");
+        assert_eq!(Strings::new("en", "zh_TW").get("nav.builtin"), "Built-in Settings");
+        assert_eq!(Strings::new("zh_TW", "zh_TW").get("nav.builtin"), "滑鼠設定");
     }
 
     #[test]
     fn lookup_falls_back_to_default_language_then_key() {
         let mut s = Strings::new("en", "zh_TW");
-        s.table.remove("nav.device");
-        assert_eq!(s.get("nav.device"), "裝置");
+        s.table.remove("nav.builtin");
+        assert_eq!(s.get("nav.builtin"), "滑鼠設定");
         assert_eq!(s.get("no.such.key"), "no.such.key");
         assert_eq!(s.get(""), "");
     }

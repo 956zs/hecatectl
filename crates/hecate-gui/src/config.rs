@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 const SHIPPED: &str = include_str!("../resources/config.json");
-/// One transaction can take 2 x 200 ms, so polling faster would keep the receiver busy.
+/// Floor for the poll intervals so polling never keeps the receiver busy.
 const MIN_POLL: Duration = Duration::from_millis(500);
 const MAX_POLL: Duration = Duration::from_secs(60);
 /// `language` value that follows the locale.
@@ -17,7 +17,10 @@ const AUTO: &str = "auto";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
-    pub device_poll: Duration,
+    /// Device re-probe interval while no mouse answers (none found, or asleep); vendor: 1 s.
+    pub device_poll_offline: Duration,
+    /// Re-probe interval while the mouse is online; vendor: 5 s.
+    pub device_poll_online: Duration,
     pub theme_poll: Duration,
     /// colors.json; relative paths are under `$XDG_STATE_HOME` (default `~/.local/state`).
     pub theme_colors_file: PathBuf,
@@ -27,6 +30,8 @@ pub struct Config {
     pub default_language: &'static str,
     pub font_family: String,
     pub icon_font_family: String,
+    /// "Product Specification" page (vendor FUN_140243010).
+    pub product_url: String,
 }
 
 pub fn get() -> &'static Config {
@@ -89,13 +94,15 @@ pub fn parse(user: Option<&str>) -> Result<Config, String> {
     };
     let default_language = shipped_language("default_language")?;
     Ok(Config {
-        device_poll: poll("device_poll_ms")?,
+        device_poll_offline: poll("device_poll_offline_ms")?,
+        device_poll_online: poll("device_poll_online_ms")?,
         theme_poll: poll("theme_poll_ms")?,
         theme_colors_file: PathBuf::from(string("theme_colors_file")?),
         language,
         default_language,
         font_family: string("font_family")?,
         icon_font_family: string("icon_font_family")?,
+        product_url: string("product_url")?,
     })
 }
 
@@ -131,17 +138,20 @@ mod tests {
     #[test]
     fn shipped_settings_are_valid() {
         let c = parse(None).unwrap();
-        assert_eq!(c.device_poll, Duration::from_secs(2));
+        assert_eq!(c.device_poll_offline, Duration::from_secs(1));
+        assert_eq!(c.device_poll_online, Duration::from_secs(5));
         assert_eq!(c.theme_poll, Duration::from_secs(2));
         assert_eq!(c.default_language, "zh_TW");
         assert_eq!(c.language, None);
         assert_eq!(c.theme_colors_file, Path::new("quickshell/user/generated/colors.json"));
+        assert!(c.product_url.starts_with("https://"));
     }
 
     #[test]
     fn user_values_override_shipped_ones() {
-        let c = parse(Some(r#"{"device_poll_ms": 3000, "default_language": "en"}"#)).unwrap();
-        assert_eq!(c.device_poll, Duration::from_secs(3));
+        let c = parse(Some(r#"{"device_poll_online_ms": 3000, "default_language": "en"}"#)).unwrap();
+        assert_eq!(c.device_poll_online, Duration::from_secs(3));
+        assert_eq!(c.device_poll_offline, Duration::from_secs(1));
         assert_eq!(c.default_language, "en");
         assert_eq!(c.theme_poll, Duration::from_secs(2));
         assert_eq!(parse(Some("{}")).unwrap(), parse(None).unwrap());
@@ -155,16 +165,16 @@ mod tests {
 
     #[test]
     fn poll_intervals_are_clamped() {
-        let c = parse(Some(r#"{"device_poll_ms": 0, "theme_poll_ms": 99999999}"#)).unwrap();
-        assert_eq!(c.device_poll, MIN_POLL);
+        let c = parse(Some(r#"{"device_poll_offline_ms": 0, "theme_poll_ms": 99999999}"#)).unwrap();
+        assert_eq!(c.device_poll_offline, MIN_POLL);
         assert_eq!(c.theme_poll, MAX_POLL);
     }
 
     #[test]
     fn errors_name_the_bad_key() {
         assert_eq!(parse(Some(r#"{"poll": 1}"#)).unwrap_err(), "unknown key 'poll'");
-        assert!(parse(Some(r#"{"device_poll_ms": -5}"#)).unwrap_err().contains("'device_poll_ms'"));
-        assert!(parse(Some(r#"{"device_poll_ms": "2000"}"#)).unwrap_err().contains("'device_poll_ms'"));
+        assert!(parse(Some(r#"{"device_poll_online_ms": -5}"#)).unwrap_err().contains("'device_poll_online_ms'"));
+        assert!(parse(Some(r#"{"device_poll_offline_ms": "1000"}"#)).unwrap_err().contains("'device_poll_offline_ms'"));
         assert!(parse(Some(r#"{"font_family": 3}"#)).unwrap_err().contains("'font_family'"));
         assert!(parse(Some(r#"{"default_language": "fr"}"#)).unwrap_err().contains("'default_language'"));
         assert!(parse(Some(r#"{"language": "fr"}"#)).unwrap_err().contains("'language'"));

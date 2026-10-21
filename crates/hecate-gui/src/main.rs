@@ -2,7 +2,10 @@
 
 mod bridge;
 mod config;
+mod display;
+mod dpi_slider;
 mod palette;
+mod settings_map;
 mod strings;
 mod worker;
 
@@ -21,7 +24,8 @@ const APP_ID: &str = "hecate-gui";
 /// Development options. Everything else on the command line is left to Qt.
 #[derive(Debug, Default, PartialEq)]
 struct Options {
-    /// `--screenshot PATH`: save the window as an image a few seconds after start, then quit.
+    /// `--screenshot PATH`: save the window as an image once the settings are loaded (at most
+    /// 20 s after start), then quit.
     /// With `QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software` nothing appears on screen.
     screenshot: Option<String>,
     /// `--page N`: start on navigation entry N.

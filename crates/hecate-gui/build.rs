@@ -11,10 +11,15 @@ const QML_FILES: &[&str] = &[
     "qml/SegmentedButtons.qml",
     "qml/TonalButton.qml",
     "qml/Snackbar.qml",
+    "qml/SettingRow.qml",
+    "qml/ToggleSwitch.qml",
+    "qml/DropDown.qml",
+    "qml/StageCard.qml",
+    "qml/AppDialog.qml",
     "qml/PerformancePage.qml",
-    "qml/DevicePage.qml",
+    "qml/BuiltinSettingsPage.qml",
 ];
-const QML_SINGLETONS: &[&str] = &["qml/Format.qml"];
+const QML_SINGLETONS: &[&str] = &["qml/Format.qml", "qml/Model.qml"];
 
 fn main() {
     let files = QML_FILES
