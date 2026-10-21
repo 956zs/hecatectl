@@ -2,7 +2,8 @@ use hecate_core::mouse::{self, Mouse};
 use hecate_core::protocol::{self, PairingStatus};
 use hecate_core::settings::{self, Checked, KeyBinding, Settings};
 use hecate_core::slots::{self, KeyState, Slots};
-use hecate_core::hidraw;
+use hecate_core::backup::{self, Backup, RestorePlan, SkipReason};
+use hecate_core::hidraw::{self, DeviceInfo};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -20,7 +21,10 @@ commands:
   longrange         show the long-distance mode
   longrange on|off  set the long-distance mode
   reset --yes       factory reset: all settings, key mappings and macros
-  pair --yes        put the receiver into pairing mode and wait for the mouse";
+  pair --yes        put the receiver into pairing mode and wait for the mouse
+  backup <FILE>     save settings, key mappings and slots (flash 0x0000-0x1aff) to a new file
+  restore <FILE> [--dry-run]
+                    write back what differs from a backup; --dry-run only prints the plan";
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1).collect()) {
@@ -52,6 +56,9 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
         ["reset"] => Err("factory reset erases all settings, key mappings and macros on the mouse; \
                           run 'hecatectl reset --yes' to do it"
             .into()),
+        ["backup", file] => cmd_backup(device, Path::new(file)),
+        ["restore", file] => cmd_restore(device, Path::new(file), false),
+        ["restore", file, "--dry-run"] | ["restore", "--dry-run", file] => cmd_restore(device, Path::new(file), true),
         ["pair", "--yes"] => cmd_pair(&mut open(device)?),
         ["pair"] => Err("pairing puts the receiver into pairing mode and replaces its current link; \
                          run 'hecatectl pair --yes' to do it"
@@ -91,6 +98,15 @@ fn resolve_node(device: Option<PathBuf>) -> Result<PathBuf, String> {
 
 fn open_node(node: &Path) -> Result<Mouse, String> {
     Ok(Mouse::new(hidraw::Device::open(node)?))
+}
+
+/// The detected interface behind `--device` or the only one found, with its product id and versions.
+fn device_info(device: Option<PathBuf>) -> Result<DeviceInfo, String> {
+    let node = resolve_node(device)?;
+    hidraw::find_devices()
+        .into_iter()
+        .find(|d| d.node == node)
+        .ok_or_else(|| format!("{} is not the config interface of a HECATE G3M PRO (updated)", node.display()))
 }
 
 fn open(device: Option<PathBuf>) -> Result<Mouse, String> {
@@ -411,6 +427,120 @@ fn modifier_names(mask: u16) -> String {
     names.join("+")
 }
 
+fn cmd_backup(device: Option<PathBuf>, path: &Path) -> Result<(), String> {
+    if path.exists() {
+        return Err(format!("{} already exists; pick a new file name", path.display()));
+    }
+    let info = device_info(device)?;
+    let mut m = open_node(&info.node)?;
+    eprintln!("reading flash 0x0000-0x1aff (about 700 reads)...");
+    let b = Backup::take(&mut m, info.product_id, info.receiver_version)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    std::io::Write::write_all(&mut file, b.serialize().as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
+    print!("{}", backup_summary(&b));
+    println!("saved to {}", path.display());
+    Ok(())
+}
+
+fn cmd_restore(device: Option<PathBuf>, path: &Path, dry_run: bool) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let b = Backup::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    print!("{}", backup_summary(&b));
+    let info = device_info(device)?;
+    let mut m = open_node(&info.node)?;
+    m.require_online()?;
+    let firmware = m.version()?;
+    if firmware != b.firmware {
+        println!(
+            "warning: the mouse runs firmware {}, the backup was taken on {}",
+            protocol::format_version(firmware),
+            protocol::format_version(b.firmware)
+        );
+    }
+    eprintln!("reading the current flash (about 700 reads)...");
+    let plan = backup::plan_restore(info.product_id, &m.read_image()?, &b)?;
+    print!("{}", format_plan(&plan));
+    if dry_run {
+        println!("dry run: nothing was sent");
+        return Ok(());
+    }
+    if plan.writes.is_empty() {
+        return Ok(());
+    }
+    m.restore(&plan)?;
+    eprintln!("verifying: reading the flash again...");
+    let left = backup::plan_restore(info.product_id, &m.read_image()?, &b)?;
+    if !left.writes.is_empty() {
+        return Err(format!("{} writes still differ after the restore:\n{}", left.writes.len(), format_plan(&left)));
+    }
+    println!("restored: {} writes, each read back, and the mouse now matches the backup", plan.writes.len());
+    Ok(())
+}
+
+fn backup_summary(b: &Backup) -> String {
+    let s = b.settings();
+    let count = usize::from(s.dpi_stage_count.value).min(s.dpi_stages.len());
+    let dpi: Vec<String> = s.dpi_stages[..count].iter().map(|d| d.value.dpi().to_string()).collect();
+    let slots = b.slots();
+    format!(
+        "backup of {:04x}:{:04x}, firmware {}, receiver {}, taken {}\n\
+         report rate {}, {} DPI stages: {}\n\
+         {} shortcut and {} macro slots in use\n",
+        hidraw::VENDOR_ID,
+        b.product_id,
+        protocol::format_version(b.firmware),
+        b.receiver.map_or("unknown".into(), protocol::format_version),
+        backup::utc_text(b.created_unix),
+        mouse::describe_rate(s.report_rate.valid.then_some(s.report_rate.value)),
+        s.dpi_stage_count.value,
+        dpi.join(" "),
+        slots.shortcuts.iter().flatten().count(),
+        slots.macros.iter().flatten().count(),
+    )
+}
+
+/// Flash area of a write address, for the restore plan.
+fn write_label(addr: u16) -> String {
+    let at = usize::from(addr);
+    match at {
+        0..=0xFF => "settings".into(),
+        0x100..=0x2FF => format!("shortcut slot {}", (at - 0x100) / 0x20),
+        _ => format!("macro slot {}", (at - 0x300) / 0x180),
+    }
+}
+
+fn format_plan(plan: &RestorePlan) -> String {
+    let mut out = String::new();
+    if plan.writes.is_empty() {
+        out.push_str("no writes needed: the mouse matches the backup\n");
+    }
+    for w in &plan.writes {
+        for (k, row) in w.bytes.chunks(16).enumerate() {
+            let hex: Vec<String> = row.iter().map(|b| format!("{b:02x}")).collect();
+            let head = if k == 0 { format!("0x{:04x}  {:<18}", w.addr, write_label(w.addr)) } else { " ".repeat(26) };
+            writeln!(out, "{head}{}", hex.join(" ")).expect("write to String");
+        }
+    }
+    if !plan.skipped.is_empty() {
+        out.push_str("not restorable, left as they are:\n");
+        for s in &plan.skipped {
+            let why = match s.reason {
+                SkipReason::InvalidInBackup => "check byte is wrong in the backup",
+                SkipReason::Unmodelled => "not a field the vendor app writes",
+            };
+            writeln!(out, "0x{:04x}-0x{:04x}  {why}", s.range.start, s.range.end - 1).expect("write to String");
+        }
+    }
+    if !plan.writes.is_empty() {
+        writeln!(out, "{} writes planned", plan.writes.len()).expect("write to String");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,6 +685,67 @@ mod tests {
             "shortcut slot 0 (left button): down consumer 0x00e9, up consumer 0x00e9\n\
              macro slot 6 (key 7) \"a\\xe5\", 2 events:\n    down key 0x04, 50 ms\n    up key 0x04, 0 ms\n\
              1 of 16 shortcut slots and 1 of 16 macro slots in use\n"
+        );
+    }
+
+    fn sample_backup() -> Backup {
+        let mut image = vec![0xff; backup::IMAGE_LEN];
+        image[0x00..0x02].copy_from_slice(&protocol::guarded(0x01));
+        image[0x02..0x04].copy_from_slice(&protocol::guarded(2));
+        image[0x0c..0x10].copy_from_slice(&[7, 7, 0, protocol::checksum(&[7, 7, 0])]);
+        image[0x10..0x14].copy_from_slice(&[15, 15, 0, protocol::checksum(&[15, 15, 0])]);
+        let volume_up = slots::Shortcut::multimedia(0xe9).encode().unwrap();
+        image[0x180..0x180 + volume_up.len()].copy_from_slice(&volume_up);
+        Backup::new(1_761_040_000, 0xd3fb, 0x0313, Some(0x0102), image).unwrap()
+    }
+
+    #[test]
+    fn backup_summaries() {
+        assert_eq!(
+            backup_summary(&sample_backup()),
+            "backup of 35bb:d3fb, firmware v3.19, receiver v1.02, taken 2025-10-21 09:46:40 UTC\n\
+             report rate 1000 Hz, 2 DPI stages: 400 800\n\
+             1 shortcut and 0 macro slots in use\n"
+        );
+        let erased = Backup::new(0, 0xd3fc, 0, None, vec![0xff; backup::IMAGE_LEN]).unwrap();
+        let text = backup_summary(&erased);
+        assert!(text.contains("receiver unknown") && text.contains("report rate invalid"), "{text}");
+        assert!(text.contains("6 DPI stages: 12800 12800 12800 12800 12800 12800"), "{text}");
+    }
+
+    #[test]
+    fn write_labels() {
+        assert_eq!(write_label(0x0000), "settings");
+        assert_eq!(write_label(0x00e1), "settings");
+        assert_eq!(write_label(0x0100), "shortcut slot 0");
+        assert_eq!(write_label(0x02e0), "shortcut slot 15");
+        assert_eq!(write_label(0x0300), "macro slot 0");
+        assert_eq!(write_label(0x1980), "macro slot 15");
+    }
+
+    #[test]
+    fn plan_listing() {
+        let empty = RestorePlan { writes: vec![], skipped: vec![] };
+        assert_eq!(format_plan(&empty), "no writes needed: the mouse matches the backup\n");
+        let plan = RestorePlan {
+            writes: vec![
+                settings::FlashWrite { addr: 0x0000, bytes: vec![0x01, 0x54] },
+                settings::FlashWrite { addr: 0x0300, bytes: (0..18).collect() },
+            ],
+            skipped: vec![
+                backup::Skipped { range: 0x06..0x07, reason: SkipReason::Unmodelled },
+                backup::Skipped { range: 0xc1..0xc3, reason: SkipReason::InvalidInBackup },
+            ],
+        };
+        assert_eq!(
+            format_plan(&plan),
+            "0x0000  settings          01 54\n\
+             0x0300  macro slot 0      00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f\n\
+             \x20                         10 11\n\
+             not restorable, left as they are:\n\
+             0x0006-0x0006  not a field the vendor app writes\n\
+             0x00c1-0x00c2  check byte is wrong in the backup\n\
+             2 writes planned\n"
         );
     }
 }

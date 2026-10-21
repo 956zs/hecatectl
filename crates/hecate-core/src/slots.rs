@@ -5,7 +5,7 @@
 //! bytes the vendor writers send (FUN_180006e60 / FUN_180006a70 via FUN_180002ac0).
 
 use crate::protocol::checksum;
-use std::ops::RangeInclusive;
+use std::ops::{Range, RangeInclusive};
 
 pub const SLOTS: usize = 16;
 const SHORTCUT_BASE: usize = 0x100;
@@ -158,8 +158,6 @@ impl Macro {
         if body[end] != checksum(&body[usize::from(MACRO_COUNT_OFFSET)..end]) {
             return None;
         }
-        let len = usize::from(body[0]);
-        let name = if (1..=MACRO_NAME_MAX).contains(&len) { body[1..=len].to_vec() } else { Vec::new() };
         let events = body[MACRO_EVENTS_OFFSET..end]
             .chunks(5)
             .map(|e| MacroEvent {
@@ -169,28 +167,54 @@ impl Macro {
                 delay_ms: u16::from_be_bytes([e[3], e[4]]),
             })
             .collect();
-        Some(Self { name, events })
+        Some(Self { name: stored_name(body), events })
     }
 
     /// `[name length, name, 0xFF padding to 0x1F, n, events.., check over n and the events]`,
     /// 0x21 + 5n bytes (FUN_180002ac0 into a 0xFF-filled image, written by FUN_180006a70).
     pub fn encode(&self) -> Result<Vec<u8>, String> {
         check_count("macro", self.events.len(), &MACRO_EVENTS)?;
-        if self.name.len() > MACRO_NAME_MAX {
-            return Err(format!("macro name is {} bytes, max {MACRO_NAME_MAX}", self.name.len()));
-        }
-        let mut out = vec![0xFF; MACRO_EVENTS_OFFSET];
-        out[0] = self.name.len() as u8;
-        out[1..=self.name.len()].copy_from_slice(&self.name);
-        out[usize::from(MACRO_COUNT_OFFSET)] = self.events.len() as u8;
-        for e in &self.events {
-            out.push(event_head(e.state, e.kind)?);
-            out.extend(e.code.to_le_bytes());
-            out.extend(e.delay_ms.to_be_bytes());
-        }
-        out.push(checksum(&out[usize::from(MACRO_COUNT_OFFSET)..]));
-        Ok(out)
+        macro_image(&self.name, &self.events)
     }
+}
+
+fn macro_image(name: &[u8], events: &[MacroEvent]) -> Result<Vec<u8>, String> {
+    if name.len() > MACRO_NAME_MAX {
+        return Err(format!("macro name is {} bytes, max {MACRO_NAME_MAX}", name.len()));
+    }
+    let mut out = vec![0xFF; MACRO_EVENTS_OFFSET];
+    out[0] = name.len() as u8;
+    out[1..=name.len()].copy_from_slice(name);
+    out[usize::from(MACRO_COUNT_OFFSET)] = events.len() as u8;
+    for e in events {
+        out.push(event_head(e.state, e.kind)?);
+        out.extend(e.code.to_le_bytes());
+        out.extend(e.delay_ms.to_be_bytes());
+    }
+    out.push(checksum(&out[usize::from(MACRO_COUNT_OFFSET)..]));
+    Ok(out)
+}
+
+/// The name the vendor parser keeps from a macro slot: bytes 1..=len when len is 1..=30, else empty
+/// (FUN_180002ba0). It keeps it even when the events are invalid.
+pub fn stored_name(slot: &[u8]) -> Vec<u8> {
+    let len = usize::from(slot.first().copied().unwrap_or(0));
+    match slot.get(1..=len) {
+        Some(name) if (1..=MACRO_NAME_MAX).contains(&len) => name.to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+/// What the vendor writer sends for a shortcut slot with no events (FUN_180006e60 with n = 0).
+pub const DISABLED_SHORTCUT: [u8; 2] = [0x00, 0xFF];
+
+/// Length of a disabled macro slot write: header and count, then the check byte.
+pub const DISABLED_MACRO_LEN: usize = MACRO_EVENTS_OFFSET + 1;
+
+/// What the vendor writer sends for a macro slot with no events: name kept, count 0, check 0x55,
+/// 0x21 bytes (FUN_180002ac0 with n = 0).
+pub fn disabled_macro(name: &[u8]) -> Result<Vec<u8>, String> {
+    macro_image(name, &[])
 }
 
 /// Everything in the slot area. Index i belongs to Keys[i].
@@ -198,6 +222,34 @@ impl Macro {
 pub struct Slots {
     pub shortcuts: [Option<Shortcut>; SLOTS],
     pub macros: [Option<Macro>; SLOTS],
+}
+
+impl Slots {
+    /// Decodes every slot from a flash image that starts at address 0, as FUN_1800063c0 does over the
+    /// vendor's 0x2000-byte image. Slots past the end of `image` are None.
+    pub fn from_image(image: &[u8]) -> Self {
+        Self {
+            shortcuts: std::array::from_fn(|i| image.get(shortcut_range(i)).and_then(Shortcut::decode)),
+            macros: std::array::from_fn(|j| image.get(macro_range(j)).and_then(Macro::decode)),
+        }
+    }
+}
+
+/// Flash used by settings and slots, 0x0000..0x1B00 (protocol.md §3.3). Nothing above is read or written.
+pub const USED_FLASH_LEN: usize = MACRO_BASE + MACRO_STRIDE * SLOTS;
+
+/// Whole region of shortcut slot `i` (0x20 bytes), used or not. Panics if `i >= SLOTS`.
+pub fn shortcut_range(i: usize) -> Range<usize> {
+    assert!(i < SLOTS, "shortcut slot {i}");
+    let at = SHORTCUT_BASE + SHORTCUT_STRIDE * i;
+    at..at + SHORTCUT_STRIDE
+}
+
+/// Whole region of macro slot `j` (0x180 bytes), used or not. Panics if `j >= SLOTS`.
+pub fn macro_range(j: usize) -> Range<usize> {
+    assert!(j < SLOTS, "macro slot {j}");
+    let at = MACRO_BASE + MACRO_STRIDE * j;
+    at..at + MACRO_STRIDE
 }
 
 fn slot_addr(what: &str, base: usize, stride: usize, i: usize) -> Result<u16, String> {

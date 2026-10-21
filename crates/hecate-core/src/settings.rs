@@ -370,6 +370,12 @@ fn entries(s: &Settings) -> Vec<Entry> {
     e
 }
 
+/// Flash range (data and check byte) and validity of every modelled group, in the vendor writer's
+/// order. Bytes outside these ranges are never written.
+pub fn group_ranges(s: &Settings) -> Vec<(std::ops::Range<usize>, bool)> {
+    entries(s).into_iter().map(|e| (e.addr..e.addr + e.data.len() + 1, e.valid)).collect()
+}
+
 fn changed<T: PartialEq>(old: &Checked<T>, new: &Checked<T>) -> bool {
     old.value != new.value || (!old.valid && new.valid)
 }
@@ -821,6 +827,19 @@ mod tests {
             assert_eq!(after[at], block[at], "unmodelled byte 0x{at:02x} changed");
         }
         assert!(diff(&decode(&after), &new).is_empty());
+    }
+
+    #[test]
+    fn group_ranges_match_the_spec() {
+        let groups = group_ranges(&decode(&vendor_block()));
+        let mut got: Vec<_> = groups.iter().map(|(r, _)| r.clone()).collect();
+        let mut want = writable_ranges();
+        got.sort_by_key(|r| r.start);
+        want.sort_by_key(|r| r.start);
+        assert_eq!(got, want);
+        assert_eq!(groups[0], (0x00..0x02, true)); // vendor order starts with the rate
+        assert!(!groups.iter().find(|(r, _)| r.start == 0xE1).unwrap().1); // fury mode is erased in the fixture
+        assert!(group_ranges(&decode(&[0xFF; CONFIG_BLOCK_LEN])).iter().all(|(_, valid)| !valid));
     }
 
     #[test]
