@@ -58,12 +58,16 @@ pub fn build(cmd: u8, body: &[u8]) -> Result<Packet, String> {
     Ok(p)
 }
 
-/// True when `resp` is a well-formed answer to `req`.
+/// True when `resp` is a well-formed answer to `req`: same report ID and command, valid checksum, and for
+/// flash reads and writes the echoed `[2..6]` (00, address, length; seen live, protocol.md §10a). The vendor
+/// matches only `[0..2]` (FUN_180014fd0), which lets another process's flash reply pass for ours: hidraw
+/// hands every input report to every open descriptor.
 pub fn is_response_to(req: &Packet, resp: &[u8]) -> bool {
     resp.len() == PACKET_LEN
         && resp[0] == req[0]
         && resp[1] == req[1]
         && resp[PACKET_LEN - 1] == checksum(&resp[..PACKET_LEN - 1])
+        && (!matches!(req[1], CMD_FLASH_READ | CMD_FLASH_WRITE) || resp[2..6] == req[2..6])
 }
 
 /// Read request for the 10 bytes at `addr`: `08 08 00 AH AL 0A` (FUN_180013880).
@@ -220,6 +224,34 @@ mod tests {
         let other = build(0x03, &[]).unwrap(); // different command
         assert!(!is_response_to(&req, &other));
         assert!(!is_response_to(&req, &resp[..16])); // short read
+    }
+
+    #[test]
+    fn flash_replies_must_echo_address_and_length() {
+        // live: a read at 0x100 answers `08 08 00 01 00 0a <data>`
+        let req = flash_read_request(0x0100);
+        let reply = |echo: [u8; 4]| {
+            let mut body = echo.to_vec();
+            body.extend([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+            build(CMD_FLASH_READ, &body).unwrap()
+        };
+        assert!(is_response_to(&req, &reply([0x00, 0x01, 0x00, 0x0a])));
+        assert!(!is_response_to(&req, &reply([0x00, 0x01, 0x0a, 0x0a]))); // another process reading 0x10a
+        assert!(!is_response_to(&req, &reply([0x00, 0x00, 0x00, 0x0a]))); // high byte differs
+        assert!(!is_response_to(&req, &reply([0x00, 0x01, 0x00, 0x02]))); // length differs
+        assert!(!is_response_to(&req, &reply([0x01, 0x01, 0x00, 0x0a]))); // byte 2 differs
+        // live: the 1000 Hz write is echoed as `08 07 00 00 00 02 01 54 ..`
+        let write = flash_write_requests(ADDR_REPORT_RATE, &guarded(0x01)).unwrap()[0];
+        assert!(is_response_to(&write, &write));
+        let mut other = write;
+        other[4] = 0x02;
+        other[16] = checksum(&other[..16]);
+        assert!(!is_response_to(&write, &other));
+        // other commands do not echo, so [2..6] is not compared
+        let online = build(CMD_ONLINE, &[]).unwrap();
+        assert!(is_response_to(&online, &build(CMD_ONLINE, &[0, 0, 0, 0x01, 0x01, 0xd5]).unwrap()));
+        let version = build(CMD_VERSION, &[]).unwrap();
+        assert!(is_response_to(&version, &build(CMD_VERSION, &[0, 0, 0, 0x02, 0x03, 0x13]).unwrap()));
     }
 
     fn hex(s: &str) -> Vec<u8> {

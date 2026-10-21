@@ -118,9 +118,77 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
 }
 
+/// How long a locked operation waits for another process's operation to finish.
+const LOCK_WAIT: Duration = Duration::from_secs(10);
+const LOCK_POLL: Duration = Duration::from_millis(20);
+
+/// Re-entrant lock bookkeeping for one Device: only the outermost lock takes the OS lock and only the
+/// matching outermost unlock releases it.
+#[derive(Debug, Default)]
+struct LockDepth(u32);
+
+impl LockDepth {
+    /// Whether the next `enter` must take the OS lock first.
+    fn needs_os_lock(&self) -> bool {
+        self.0 == 0
+    }
+
+    fn enter(&mut self) {
+        self.0 += 1;
+    }
+
+    /// Leaves one level. True when that was the outermost one, so the OS lock must be released.
+    /// An unmatched leave is ignored.
+    fn leave(&mut self) -> bool {
+        match self.0 {
+            0 => false,
+            n => {
+                self.0 = n - 1;
+                n == 1
+            }
+        }
+    }
+}
+
+/// `flock(LOCK_EX | LOCK_NB)`, retried until `wait` has passed.
+fn lock_file(file: &File, wait: Duration, debug: bool) -> Result<(), String> {
+    let deadline = Instant::now() + wait;
+    let mut announced = false;
+    loop {
+        // SAFETY: the descriptor stays open for the duration of the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EWOULDBLOCK) => {}
+            _ => return Err(format!("lock: {e}")),
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "device busy: another hecatectl or hecate-gui operation is running (waited {} s)",
+                wait.as_secs()
+            ));
+        }
+        if debug && !announced {
+            eprintln!("lock busy, waiting");
+            announced = true;
+        }
+        std::thread::sleep(LOCK_POLL);
+    }
+}
+
+fn unlock_file(file: &File) {
+    // SAFETY: as above. Unlocking cannot fail in a way we could act on; closing the fd releases it anyway.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+}
+
 pub struct Device {
     file: File,
     debug: bool,
+    lock: LockDepth,
+    lock_wait: Duration,
 }
 
 impl Device {
@@ -137,7 +205,24 @@ impl Device {
                 ),
                 _ => format!("{}: {e}", node.display()),
             })?;
-        Ok(Self { file, debug: std::env::var_os(DEBUG_ENV).is_some() })
+        Ok(Self { file, debug: std::env::var_os(DEBUG_ENV).is_some(), lock: LockDepth::default(), lock_wait: LOCK_WAIT })
+    }
+
+    /// Exclusive advisory lock on the hidraw node (`flock`), so operations of separate processes do not
+    /// interleave and take each other's replies. Re-entrant: nested calls only count. Every `lock` needs
+    /// one `unlock`. Waits up to 10 s for another process, then fails with "device busy".
+    pub fn lock(&mut self) -> Result<(), String> {
+        if self.lock.needs_os_lock() {
+            lock_file(&self.file, self.lock_wait, self.debug)?;
+        }
+        self.lock.enter();
+        Ok(())
+    }
+
+    pub fn unlock(&mut self) {
+        if self.lock.leave() {
+            unlock_file(&self.file);
+        }
     }
 
     /// Sends `req` and waits for the matching response, like the vendor library does.
@@ -145,8 +230,15 @@ impl Device {
         self.transact_with(req, TRIES, TIMEOUT)
     }
 
-    /// `transact` with an explicit retry count and per-try timeout.
+    /// `transact` with an explicit retry count and per-try timeout, under the device lock.
     pub fn transact_with(&mut self, req: &Packet, tries: u32, timeout: Duration) -> Result<Packet, String> {
+        self.lock()?;
+        let result = self.transact_locked(req, tries, timeout);
+        self.unlock();
+        result
+    }
+
+    fn transact_locked(&mut self, req: &Packet, tries: u32, timeout: Duration) -> Result<Packet, String> {
         for _ in 0..tries {
             self.drain();
             if self.debug {
@@ -266,5 +358,63 @@ mod tests {
         assert_eq!(parse_hid_id(""), None);
         assert_eq!(parse_hid_id("HID_ID=0003:zz:0000D3FB"), None);
         assert_eq!(parse_hid_id("HID_ID=0003:0001000000:0000D3FB"), None);
+    }
+
+    #[test]
+    fn lock_depth_counts_nesting() {
+        let mut d = LockDepth::default();
+        assert!(d.needs_os_lock());
+        d.enter();
+        assert!(!d.needs_os_lock());
+        d.enter(); // nested operation
+        assert!(!d.leave(), "inner unlock keeps the OS lock");
+        assert!(!d.needs_os_lock());
+        assert!(d.leave(), "outermost unlock releases it");
+        assert!(d.needs_os_lock());
+        assert!(!d.leave(), "unmatched unlock is ignored");
+        assert!(d.needs_os_lock());
+    }
+
+    /// An empty regular file in the temp dir; flock works on it like on the hidraw node.
+    fn temp_file(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("hecatectl-lock-{tag}-{}-{nanos}", std::process::id()));
+        fs::write(&path, b"").unwrap();
+        path
+    }
+
+    #[test]
+    fn second_descriptor_cannot_lock_while_the_first_holds_it() {
+        let path = temp_file("fd");
+        let (a, b) = (File::open(&path).unwrap(), File::open(&path).unwrap());
+        assert_eq!(lock_file(&a, Duration::ZERO, false), Ok(()));
+        let started = Instant::now();
+        let err = lock_file(&b, Duration::from_millis(60), false).unwrap_err();
+        assert!(err.starts_with("device busy"), "{err}");
+        assert!(started.elapsed() >= Duration::from_millis(60), "waited the bounded time");
+        unlock_file(&a);
+        assert_eq!(lock_file(&b, Duration::ZERO, false), Ok(()));
+        unlock_file(&b);
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn device_lock_is_reentrant_and_released_by_the_outermost_unlock() {
+        let path = temp_file("dev");
+        let (mut a, mut b) = (Device::open(&path).unwrap(), Device::open(&path).unwrap());
+        b.lock_wait = Duration::from_millis(30);
+        a.lock().unwrap();
+        a.lock().unwrap(); // a composite operation calling another one
+        assert!(b.lock().is_err());
+        a.unlock();
+        assert!(b.lock().is_err(), "inner unlock must not release the lock");
+        a.unlock();
+        assert_eq!(b.lock(), Ok(()));
+        a.lock_wait = Duration::from_millis(30);
+        assert!(a.lock().is_err(), "now the other side holds it");
+        b.unlock();
+        assert_eq!(a.lock(), Ok(()));
+        a.unlock();
+        fs::remove_file(&path).unwrap();
     }
 }
