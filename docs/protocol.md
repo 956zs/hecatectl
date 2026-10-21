@@ -406,6 +406,15 @@ offsets. The struct-to-flash mapping comes from FUN_180005840/FUN_1800063c0 (rea
 
 `v,c` = value byte, then check `0x55-v`. `n+c` = n data bytes, then one check over them.
 
+The live image (2026-10-21, firmware 0x0313) has well-formed groups at addresses the vendor app neither parses nor
+writes. They are not modelled, and restore never writes them:
+- 0x54 `ff 00 ff 57`: a 3-byte colour (magenta) plus its check.
+- 0x58 `00 55`, 0x5A `80 d5`, 0x5C `03 52`, 0x5E `00 55`: these mirror the DPI-LED block at 0x4C–0x53
+  (mode 0, brightness 0x80, speed 3, enable 0).
+- 0xBB `0a 4b`: value 0x0A.
+- 0xBD–0xE6 are erased (FF).
+- keyDebounceTime @0xA9 is 0 here; the vendor default is 8.
+
 ### 9.1 DPI value encoding (sensor 3395, max 32000)
 
 From the UI encoder: DPI → slider position (FUN_140236030), slider → register (FUN_1402367d0), branch
