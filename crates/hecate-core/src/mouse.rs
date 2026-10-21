@@ -2,6 +2,7 @@
 
 use crate::hidraw::Device;
 use crate::protocol::{self as p, Battery};
+use crate::settings::{self, Settings};
 use std::time::{Duration, Instant};
 
 const WAKE_WAIT: Duration = Duration::from_secs(15);
@@ -100,6 +101,33 @@ impl Mouse {
                 describe_rate(other)
             )),
         }
+    }
+
+    /// Online check, then the whole settings block (flash 0x000-0x0FF), decoded.
+    pub fn read_settings(&mut self) -> Result<Settings, String> {
+        self.require_online()?;
+        let raw = self.read_flash(0, p::CONFIG_BLOCK_LEN)?;
+        let block: settings::Block = raw.try_into().map_err(|_| "short settings read".to_string())?;
+        Ok(settings::decode(&block))
+    }
+
+    /// Writes the groups that differ between `old` (as read from the mouse) and `new`, the way the
+    /// vendor save path does (FUN_180006630), then re-reads and returns the fresh settings.
+    /// Fails when a written group does not read back as written. After any error the flash state is
+    /// unknown: re-read before the next apply.
+    pub fn apply(&mut self, old: &Settings, new: &Settings) -> Result<Settings, String> {
+        settings::validate(old, new)?;
+        let writes = settings::diff(old, new);
+        if writes.is_empty() {
+            return Ok(old.clone());
+        }
+        self.require_online()?;
+        for w in &writes {
+            self.write_flash(w.addr, &w.bytes)?;
+        }
+        let fresh = self.read_settings()?;
+        settings::verify(&writes, fresh.raw())?;
+        Ok(fresh)
     }
 }
 
