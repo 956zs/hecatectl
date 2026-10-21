@@ -1,0 +1,4 @@
+# Give the logged-in user access to the HECATE G3M PRO (updated) hidraw nodes.
+# 35bb:d3fb = 2.4 GHz receiver, 35bb:d3fc = wired.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="35bb", ATTRS{idProduct}=="d3fb", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="35bb", ATTRS{idProduct}=="d3fc", TAG+="uaccess"
