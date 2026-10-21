@@ -25,7 +25,7 @@ const QML_FILES: &[&str] = &[
     "qml/LoopChoice.qml",
     "qml/NameDialog.qml",
 ];
-const QML_SINGLETONS: &[&str] = &["qml/Format.qml", "qml/Model.qml"];
+const QML_SINGLETONS: &[&str] = &["qml/Format.qml", "qml/I18n.qml", "qml/Model.qml"];
 
 fn main() {
     let files = QML_FILES

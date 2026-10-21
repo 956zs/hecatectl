@@ -14,7 +14,7 @@ const SHIPPED: &str = include_str!("../resources/config.json");
 const MIN_POLL: Duration = Duration::from_millis(500);
 const MAX_POLL: Duration = Duration::from_secs(60);
 /// `language` value that follows the locale.
-const AUTO: &str = "auto";
+pub const AUTO: &str = "auto";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -44,13 +44,14 @@ pub fn get() -> &'static Config {
     CONFIG.get_or_init(load)
 }
 
+/// `$XDG_CONFIG_HOME/hecate-gui/config.json`.
+pub fn user_config_path() -> Option<PathBuf> {
+    xdg_dir(std::env::var_os("XDG_CONFIG_HOME"), std::env::var_os("HOME"), ".config").map(|d| d.join("hecate-gui/config.json"))
+}
+
 fn load() -> Config {
     let shipped = || parse(None).expect("resources/config.json is valid");
-    let Some(path) = xdg_dir(std::env::var_os("XDG_CONFIG_HOME"), std::env::var_os("HOME"), ".config")
-        .map(|d| d.join("hecate-gui/config.json"))
-    else {
-        return shipped();
-    };
+    let Some(path) = user_config_path() else { return shipped() };
     let Ok(text) = std::fs::read_to_string(&path) else { return shipped() };
     parse(Some(&text)).unwrap_or_else(|e| {
         eprintln!("hecate-gui: {}: {e}; using the shipped settings", path.display());
@@ -114,6 +115,38 @@ pub fn parse(user: Option<&str>) -> Result<Config, String> {
     })
 }
 
+/// The user config file contents with "language" set to `language` ("auto" or a shipped language),
+/// every other key and value kept as they were. A missing or empty file gives a new one; a file that is
+/// not a JSON object is refused rather than overwritten.
+pub fn with_language(existing: Option<&str>, language: &str) -> Result<String, String> {
+    if language != AUTO && !strings::LANGUAGES.iter().any(|(code, _)| *code == language) {
+        return Err(format!("'{language}' is not a language setting"));
+    }
+    let mut map = match existing.filter(|t| !t.trim().is_empty()) {
+        None => Map::new(),
+        Some(text) => object(text).map_err(|e| format!("{e}; the file was left unchanged"))?,
+    };
+    map.insert("language".into(), Value::String(language.into()));
+    serde_json::to_string_pretty(&Value::Object(map)).map(|t| t + "\n").map_err(|e| e.to_string())
+}
+
+/// Stores the language setting in the user config file at `path`, through a temporary file in the
+/// same directory and a rename, so the file is never half written.
+pub fn save_language(path: &Path, language: &str) -> Result<(), String> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let text = with_language(existing.as_deref(), language).map_err(|e| format!("{}: {e}", path.display()))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// An XDG base directory: the variable when it holds an absolute path, else `$HOME/<fallback>`.
 pub fn xdg_dir(var: Option<OsString>, home: Option<OsString>, fallback: &str) -> Option<PathBuf> {
     match var.map(PathBuf::from) {
@@ -148,6 +181,73 @@ mod tests {
 
     fn os(s: &str) -> Option<OsString> {
         Some(OsString::from(s))
+    }
+
+    /// A scratch directory under the system temp dir, never the real config.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hecate-gui-config-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn language_into_a_missing_or_empty_file() {
+        for existing in [None, Some(""), Some("  \n")] {
+            let text = with_language(existing, "zh_TW").unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), serde_json::json!({ "language": "zh_TW" }));
+        }
+    }
+
+    #[test]
+    fn language_keeps_other_keys_and_their_order() {
+        let existing = r#"{"device_poll_online_ms": 3000, "language": "en", "font_family": "Noto Sans"}"#;
+        let text = with_language(Some(existing), "zh_TW").unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["device_poll_online_ms", "language", "font_family"]);
+        assert_eq!(v["device_poll_online_ms"], 3000);
+        assert_eq!(v["font_family"], "Noto Sans");
+        assert_eq!(v["language"], "zh_TW");
+        // The result still loads as a config.
+        assert_eq!(parse(Some(&text)).unwrap().language, Some("zh_TW"));
+    }
+
+    #[test]
+    fn each_language_setting() {
+        for (setting, loaded) in [("auto", None), ("zh_TW", Some("zh_TW")), ("en", Some("en"))] {
+            let text = with_language(None, setting).unwrap();
+            assert_eq!(parse(Some(&text)).unwrap().language, loaded, "{setting}");
+        }
+        assert!(with_language(None, "fr").unwrap_err().contains("'fr'"));
+        assert!(with_language(None, "").is_err());
+    }
+
+    #[test]
+    fn invalid_files_are_refused() {
+        for bad in ["{ broken", "[]", "\"zh_TW\"", "42"] {
+            let e = with_language(Some(bad), "zh_TW").unwrap_err();
+            assert!(e.contains("left unchanged"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn save_language_creates_updates_and_refuses() {
+        let dir = scratch("lang");
+        let path = dir.join("hecate-gui/config.json");
+        // Missing file and directory: created.
+        save_language(&path, "en").unwrap();
+        assert_eq!(parse(Some(&std::fs::read_to_string(&path).unwrap())).unwrap().language, Some("en"));
+        // Existing keys survive an update.
+        std::fs::write(&path, r#"{"theme_poll_ms": 4000, "language": "en"}"#).unwrap();
+        save_language(&path, "auto").unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!({ "theme_poll_ms": 4000, "language": "auto" }));
+        assert!(!path.with_extension("json.tmp").exists());
+        // An invalid file is not touched.
+        std::fs::write(&path, "{ broken").unwrap();
+        assert!(save_language(&path, "zh_TW").unwrap_err().contains("left unchanged"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ broken");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
