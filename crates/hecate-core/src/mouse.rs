@@ -1,5 +1,6 @@
 //! Mouse operations built on the transport, following the vendor library's sequences.
 
+use crate::backup::{self, RestorePlan};
 use crate::hidraw::Device;
 use crate::protocol::{self as p, Battery, PairingStatus};
 use crate::settings::{self, Settings};
@@ -212,6 +213,28 @@ impl Mouse {
         let addr = slots::macro_addr(j)?;
         let bytes = m.encode()?;
         self.write_verified(addr, &bytes)
+    }
+
+    /// Raw flash 0x0000..0x1B00: the settings block, then the whole shortcut area, then the whole macro
+    /// area, in the vendor's area order (FUN_180013a20) but including unused slot bytes.
+    pub fn read_image(&mut self) -> Result<Vec<u8>, String> {
+        self.require_online()?;
+        let areas = [(0, p::CONFIG_BLOCK_LEN), (0x100, 0x200), (0x300, slots::USED_FLASH_LEN - 0x300)];
+        let mut image = Vec::with_capacity(slots::USED_FLASH_LEN);
+        for (addr, len) in areas {
+            image.extend(self.read_flash(addr, len)?);
+        }
+        Ok(image)
+    }
+
+    /// Sends a restore plan in order, reading back each write before the next. Every write is checked
+    /// against the vendor's group and slot shapes first, so nothing outside them is ever sent.
+    pub fn restore(&mut self, plan: &RestorePlan) -> Result<(), String> {
+        backup::check_writes(&plan.writes)?;
+        for w in &plan.writes {
+            self.write_verified(w.addr, &w.bytes)?;
+        }
+        Ok(())
     }
 
     fn write_verified(&mut self, addr: u16, bytes: &[u8]) -> Result<(), String> {
