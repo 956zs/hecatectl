@@ -185,5 +185,10 @@
   "macro.move_down": "Move down",
   "macro.bottom": "Down to bottom",
   "macro.delete_event": "Delete",
-  "macro.clear": "Remove all"
+  "macro.clear": "Remove all",
+  "language.title": "Language",
+  "language.auto": "Auto (follow system)",
+  "language.zh_TW": "繁體中文",
+  "language.en": "English",
+  "language.save_failed": "Could not save the language setting: %1"
 }

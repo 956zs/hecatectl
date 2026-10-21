@@ -185,5 +185,10 @@
   "macro.move_down": "下移",
   "macro.bottom": "移到最下",
   "macro.delete_event": "刪除",
-  "macro.clear": "清空"
+  "macro.clear": "清空",
+  "language.title": "語言",
+  "language.auto": "自動（跟隨系統）",
+  "language.zh_TW": "繁體中文",
+  "language.en": "English",
+  "language.save_failed": "無法儲存語言設定：%1"
 }

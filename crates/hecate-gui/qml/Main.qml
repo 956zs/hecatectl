@@ -135,6 +135,13 @@ ApplicationWindow {
     }
 
     Connections {
+        target: StringTable
+        function onFailed(message) {
+            snackbar.show(message)
+        }
+    }
+
+    Connections {
         target: Macros
         function onFailed(problem) {
             snackbar.show(Model.problemText(problem))

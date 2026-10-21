@@ -9,6 +9,8 @@ GridLayout {
 
     property var choices: []
     property var current
+    // Equal columns, or chips as wide as their labels (the rest of the row is shared out).
+    property bool equalWidths: true
 
     signal chosen(var value)
 
@@ -26,7 +28,7 @@ GridLayout {
             readonly property bool selected: modelData.value === grid.current
 
             Layout.fillWidth: true
-            Layout.preferredWidth: 1
+            Layout.preferredWidth: grid.equalWidths ? 1 : -1
             implicitWidth: chipRow.implicitWidth + 24
             implicitHeight: 40
             radius: 12

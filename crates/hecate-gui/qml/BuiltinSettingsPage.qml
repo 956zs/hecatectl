@@ -26,6 +26,22 @@ ScrollView {
             Layout.alignment: Qt.AlignTop
             spacing: 16
 
+            // App setting, not a mouse setting: always available.
+            Card {
+                Layout.fillWidth: true
+                title: I18n.text("language.title")
+                icon: "translate"
+
+                ChoiceGrid {
+                    Layout.fillWidth: true
+                    equalWidths: false
+                    columns: 3
+                    choices: ["auto", "zh_TW", "en"].map(l => ({ label: I18n.text("language." + l), value: l }))
+                    current: StringTable.setting
+                    onChosen: l => StringTable.setLanguage(l)
+                }
+            }
+
             Card {
                 Layout.fillWidth: true
                 visible: Model.loaded
