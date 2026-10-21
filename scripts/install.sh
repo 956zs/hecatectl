@@ -85,6 +85,15 @@ refresh_desktop_database() {
     fi
 }
 
+# A stale icon-theme.cache hides newly installed icons from GTK and Qt lookups, so rebuild it
+# whenever one exists in the user hicolor theme.
+refresh_icon_cache() {
+    local theme="$data_dir/icons/hicolor"
+    if [[ -f $theme/icon-theme.cache ]] && command -v gtk-update-icon-cache >/dev/null; then
+        run gtk-update-icon-cache -q -f -t "$theme"
+    fi
+}
+
 rule_installed() {
     [[ -f $rule_dst ]] && cmp -s -- "$rule_src" "$rule_dst"
 }
@@ -135,6 +144,7 @@ do_install() {
         put "$icon_src" "$icons_dir/hecate-gui.svg" 644
     fi
     refresh_desktop_database
+    refresh_icon_cache
 
     case ":$PATH:" in
         *":$bin_dir:"*) ;;
@@ -161,6 +171,7 @@ do_uninstall() {
     remove "$apps_dir/hecate-gui.desktop"
     remove "$icons_dir/hecate-gui.svg"
     refresh_desktop_database
+    refresh_icon_cache
     echo "kept: your settings in ${XDG_CONFIG_HOME:-$HOME/.config}/hecate-gui (delete by hand if wanted)"
     if [[ -f $rule_dst ]]; then
         cat <<EOF
