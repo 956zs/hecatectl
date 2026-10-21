@@ -11,6 +11,7 @@ cxx.workspace = true
 cxx-qt.workspace = true
 cxx-qt-lib = { workspace = true, features = ["qt_gui", "qt_qml", "qt_quickcontrols"] }
 serde_json.workspace = true
+encoding_rs = "0.8"
 
 [build-dependencies]
 cxx-qt-build.workspace = true
